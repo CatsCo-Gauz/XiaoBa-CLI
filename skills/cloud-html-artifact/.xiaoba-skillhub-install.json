@@ -1,0 +1,16 @@
+{
+  "source": "skillhub",
+  "skillId": "ddl/cloud-html-artifact",
+  "name": "Cloud HTML Artifact",
+  "installName": "cloud-html-artifact",
+  "version": "1.0.3",
+  "packageChecksumSha256": "140fa5d8ffa9c184a6142fde09676ac97fad90607d701aa6097cfd26cc256fa4",
+  "signature": {
+    "keyId": "catsco-skillhub-prod-2026-01",
+    "signedAt": "2026-07-22T05:19:19.676Z",
+    "algorithm": "ed25519",
+    "signature": "U+Cy0MRUzJh7QEAJFCvRNM8WcmbY52AhhLSXo2itDgIEdb7vTG7FSfCmFFMFMMUpn8Xz7mOGFUfy5vKlHT2RBw=="
+  },
+  "packageUrl": "https://logs.catsco.fun:9000/packages/ddl/cloud-html-artifact/1.0.3/cloud-html-artifact-1.0.3-140fa5d8ffa9.skillpkg",
+  "installedAt": "2026-07-22T07:15:05.921Z"
+}

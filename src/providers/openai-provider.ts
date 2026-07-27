@@ -1,9 +1,18 @@
 import axios from 'axios';
 import { createHash } from 'crypto';
+import { StringDecoder } from 'string_decoder';
 import { Message, ChatConfig, ChatResponse, ContentBlock } from '../types';
 import { ToolDefinition } from '../types/tool';
 import { AIProvider, AIRequestOptions, StreamCallbacks } from './provider';
 import { ContextDebugLogger } from '../utils/context-debug-logger';
+import {
+  classifyResponsesSseEventType,
+  emptyResponseDiagnosticsEnabled,
+  errorShape,
+  recordEmptyResponseAttempt,
+  responseHeaderShape,
+  summarizeResponsesShape,
+} from '../utils/empty-response-diagnostics';
 import { normalizeOpenAIChatCompletionsUrl, normalizeOpenAIResponsesUrl } from './openai-url';
 import { resolveMaxTokens } from './output-limits';
 import {
@@ -28,7 +37,6 @@ export class OpenAIProvider implements AIProvider {
   private maxTokens: number;
   private reasoningEffort: ChatConfig['reasoningEffort'];
   private openaiApiMode: ChatConfig['openaiApiMode'];
-
   constructor(config: ChatConfig) {
     this.apiUrl = config.apiUrl!;
     this.chatCompletionsUrl = normalizeOpenAIChatCompletionsUrl(this.apiUrl);
@@ -235,6 +243,10 @@ export class OpenAIProvider implements AIProvider {
       let contentStripper = new OpenAIThinkingStripper();
       const toolCallsMap = new Map<number, { id: string; type: 'function'; function: { name: string; arguments: string } }>();
       let buffer = '';
+      // SSE byte chunks may split a UTF-8 character. Keep decoder state so a
+      // partial Chinese character is completed by the next chunk instead of
+      // becoming the Unicode replacement character.
+      const decoder = new StringDecoder('utf8');
       let streamUsage: ChatResponse['usage'] = undefined;
       let finishReason: string | undefined;
 
@@ -249,7 +261,7 @@ export class OpenAIProvider implements AIProvider {
       }
 
       stream.on('data', (chunk: Buffer) => {
-        buffer += chunk.toString();
+        buffer += decoder.write(chunk);
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
 
@@ -325,6 +337,7 @@ export class OpenAIProvider implements AIProvider {
 
       stream.on('end', () => {
         options?.signal?.removeEventListener('abort', onAbort);
+        buffer += decoder.end();
         const tail = contentStripper.flush();
         if (tail) {
           fullContent += tail;
@@ -596,14 +609,57 @@ export class OpenAIProvider implements AIProvider {
       apiUrl: this.responsesUrl,
       body,
     });
-    const response = await axios.post(this.responsesUrl, body, {
-      headers: this.headers,
-      signal: options?.signal,
-    });
+    let response;
+    try {
+      response = await axios.post(this.responsesUrl, body, {
+        headers: this.headers,
+        signal: options?.signal,
+      });
+    } catch (error) {
+      recordEmptyResponseAttempt(() => {
+        const errorResponse = (error as any)?.response;
+        return {
+          schemaVersion: 1,
+          recordedAt: new Date().toISOString(),
+          apiMode: 'responses',
+          transport: 'http',
+          outcome: errorResponse ? 'http_error' : 'transport_error',
+          ...(errorResponse ? {
+            http: {
+              status: errorResponse.status,
+              ...responseHeaderShape(errorResponse.headers),
+            },
+          } : {}),
+          error: errorShape(error),
+        };
+      });
+      throw error;
+    }
     ContextDebugLogger.dumpSdkBoundary('after', undefined, { response: response.data });
     const failure = this.responsesFailureError(response.data);
+    const parsed = failure ? undefined : this.parseResponsesResponse(response.data);
+    recordEmptyResponseAttempt(() => ({
+      schemaVersion: 1,
+      recordedAt: new Date().toISOString(),
+      apiMode: 'responses',
+      transport: 'http',
+      outcome: failure ? 'provider_failure' : 'response',
+      http: {
+        status: response.status,
+        ...responseHeaderShape(response.headers),
+      },
+      response: summarizeResponsesShape(response.data),
+      ...(parsed ? {
+        parsed: {
+          visibleChars: typeof parsed.content === 'string' ? parsed.content.length : 0,
+          toolCallCount: parsed.toolCalls?.length || 0,
+          ...(parsed.stopReason ? { stopReason: parsed.stopReason } : {}),
+        },
+      } : {}),
+      ...(failure ? { error: errorShape(failure) } : {}),
+    }));
     if (failure) throw failure;
-    return this.parseResponsesResponse(response.data);
+    return parsed!;
   }
 
   private async chatStreamResponses(
@@ -617,11 +673,33 @@ export class OpenAIProvider implements AIProvider {
       apiUrl: this.responsesUrl,
       body,
     });
-    const response = await axios.post(this.responsesUrl, body, {
-      headers: this.headers,
-      responseType: 'stream',
-      signal: options?.signal,
-    });
+    let response;
+    try {
+      response = await axios.post(this.responsesUrl, body, {
+        headers: this.headers,
+        responseType: 'stream',
+        signal: options?.signal,
+      });
+    } catch (error) {
+      recordEmptyResponseAttempt(() => {
+        const errorResponse = (error as any)?.response;
+        return {
+          schemaVersion: 1,
+          recordedAt: new Date().toISOString(),
+          apiMode: 'responses',
+          transport: 'sse',
+          outcome: errorResponse ? 'http_error' : 'transport_error',
+          ...(errorResponse ? {
+            http: {
+              status: errorResponse.status,
+              ...responseHeaderShape(errorResponse.headers),
+            },
+          } : {}),
+          error: errorShape(error),
+        };
+      });
+      throw error;
+    }
 
     return new Promise<ChatResponse>((resolve, reject) => {
       const stream = response.data;
@@ -629,8 +707,16 @@ export class OpenAIProvider implements AIProvider {
       const outputItems: any[] = [];
       let streamedVisibleText = '';
       let buffer = '';
+      // Preserve incomplete UTF-8 sequences between network chunks.
+      const decoder = new StringDecoder('utf8');
       let finalResponse: any;
       let settled = false;
+      const diagnosticsEnabled = emptyResponseDiagnosticsEnabled();
+      let diagnosticRecorded = false;
+      let eventCount = 0;
+      let malformedEventCount = 0;
+      let visibleDeltaChars = 0;
+      const eventTypes = new Set<string>();
 
       const emitVisibleText = (text: string) => {
         if (!text) return;
@@ -638,8 +724,48 @@ export class OpenAIProvider implements AIProvider {
         callbacks?.onText?.(text);
       };
 
-      const finishError = (error: Error) => {
+      type StreamOutcome = 'terminal' | 'terminal_failure' | 'transport_error' | 'stream_without_terminal' | 'stream_aborted' | 'stream_closed';
+      const recordStreamSample = (
+        outcome: StreamOutcome,
+        parsed?: ChatResponse,
+        error?: Error,
+      ) => {
+        if (!diagnosticsEnabled || diagnosticRecorded) return;
+        diagnosticRecorded = true;
+        recordEmptyResponseAttempt(() => ({
+          schemaVersion: 1,
+          recordedAt: new Date().toISOString(),
+          apiMode: 'responses',
+          transport: 'sse',
+          outcome,
+          http: {
+            status: response.status,
+            ...responseHeaderShape(response.headers),
+          },
+          ...(finalResponse ? { response: summarizeResponsesShape(finalResponse) } : {}),
+          stream: {
+            eventCount,
+            eventTypes: [...eventTypes].sort(),
+            malformedEventCount,
+            visibleDeltaChars,
+            outputItemCount: outputItems.filter(Boolean).length,
+          },
+          ...(parsed ? {
+            parsed: {
+              visibleChars: typeof parsed.content === 'string' ? parsed.content.length : 0,
+              toolCallCount: parsed.toolCalls?.length || 0,
+              ...(parsed.stopReason ? { stopReason: parsed.stopReason } : {}),
+            },
+          } : {}),
+          ...(error ? { error: errorShape(error) } : {}),
+        }));
+      };
+      const finishError = (
+        error: Error,
+        outcome: StreamOutcome = 'transport_error',
+      ) => {
         if (settled) return;
+        recordStreamSample(outcome, undefined, error);
         settled = true;
         callbacks?.onError?.(error);
         reject(error);
@@ -649,10 +775,15 @@ export class OpenAIProvider implements AIProvider {
       else options?.signal?.addEventListener('abort', onAbort, { once: true });
 
       const handleEvent = (event: any) => {
+        if (diagnosticsEnabled) {
+          eventCount += 1;
+          eventTypes.add(classifyResponsesSseEventType(event?.type));
+        }
         if (
           (event?.type === 'response.output_text.delta' || event?.type === 'response.refusal.delta')
           && typeof event.delta === 'string'
         ) {
+          if (diagnosticsEnabled) visibleDeltaChars += event.delta.length;
           const visible = contentStripper.push(event.delta);
           emitVisibleText(visible);
           return;
@@ -666,16 +797,17 @@ export class OpenAIProvider implements AIProvider {
           return;
         }
         if (event?.type === 'response.failed' || event?.type === 'error') {
-          const failure = this.responsesFailureError(event?.response || {
+          finalResponse = event?.response || {
             status: 'failed',
             error: event?.error || { message: event?.message },
-          });
-          finishError(failure || new Error('Responses API request failed'));
+          };
+          const failure = this.responsesFailureError(finalResponse);
+          finishError(failure || new Error('Responses API request failed'), 'terminal_failure');
         }
       };
 
       stream.on('data', (chunk: Buffer) => {
-        buffer += chunk.toString();
+        buffer += decoder.write(chunk);
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
         for (const line of lines) {
@@ -686,6 +818,7 @@ export class OpenAIProvider implements AIProvider {
           try {
             handleEvent(JSON.parse(data));
           } catch {
+            if (diagnosticsEnabled) malformedEventCount += 1;
             // Ignore malformed individual SSE events and continue the stream.
           }
         }
@@ -693,16 +826,20 @@ export class OpenAIProvider implements AIProvider {
 
       stream.on('end', () => {
         options?.signal?.removeEventListener('abort', onAbort);
+        buffer += decoder.end();
         if (settled) return;
         const tail = contentStripper.flush();
         emitVisibleText(tail);
         if (!finalResponse) {
-          finishError(new Error('Responses API stream ended without a terminal response'));
+          finishError(
+            new Error('Responses API stream ended without a terminal response'),
+            'stream_without_terminal',
+          );
           return;
         }
         const failure = this.responsesFailureError(finalResponse);
         if (failure) {
-          finishError(failure);
+          finishError(failure, 'terminal_failure');
           return;
         }
         if (!Array.isArray(finalResponse.output) || finalResponse.output.length === 0) {
@@ -713,6 +850,7 @@ export class OpenAIProvider implements AIProvider {
           result.content = this.visibleMessageContent({ content: streamedVisibleText });
         }
         ContextDebugLogger.dumpSdkBoundary('after', undefined, { response: finalResponse });
+        recordStreamSample('terminal', result);
         settled = true;
         callbacks?.onComplete?.(result);
         resolve(result);
@@ -720,7 +858,18 @@ export class OpenAIProvider implements AIProvider {
 
       stream.on('error', (error: Error) => {
         options?.signal?.removeEventListener('abort', onAbort);
-        finishError(error);
+        finishError(error, options?.signal?.aborted ? 'stream_aborted' : 'transport_error');
+      });
+
+      stream.on('aborted', () => {
+        options?.signal?.removeEventListener('abort', onAbort);
+        finishError(new Error('Responses API stream aborted'), 'stream_aborted');
+      });
+
+      stream.on('close', () => {
+        if (settled) return;
+        options?.signal?.removeEventListener('abort', onAbort);
+        finishError(new Error('Responses API stream closed before completion'), 'stream_closed');
       });
     });
   }

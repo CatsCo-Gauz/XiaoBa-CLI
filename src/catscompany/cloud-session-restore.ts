@@ -71,12 +71,7 @@ export class CatsCompanyCloudSessionRestorer {
       }
 
       const prepared = await this.prepareForPersistence(fetched.messages, request.signal);
-      if (
-        request.signal?.aborted
-        && !(prepared.summaryFallback && isTimeoutAbortReason(request.signal.reason))
-      ) {
-        request.signal.throwIfAborted();
-      }
+      request.signal?.throwIfAborted();
       if (this.hasLocalSession(request.sessionKey)) {
         return this.result('local_present', { fetchedMessages: fetched.fetchedMessages });
       }
@@ -172,10 +167,10 @@ export class CatsCompanyCloudSessionRestorer {
   private async prepareForPersistence(
     messages: Message[],
     signal?: AbortSignal,
-  ): Promise<{ messages: Message[]; compressed: boolean; summaryFallback: boolean }> {
+  ): Promise<{ messages: Message[]; compressed: boolean }> {
     const usedTokens = estimateMessagesTokens(messages);
     if (usedTokens <= CLOUD_RESTORE_DIRECT_TOKEN_BUDGET) {
-      return { messages, compressed: false, summaryFallback: false };
+      return { messages, compressed: false };
     }
 
     try {
@@ -197,14 +192,12 @@ export class CatsCompanyCloudSessionRestorer {
       return {
         messages: trimToTokenBudget(compacted, CLOUD_RESTORE_FINAL_TOKEN_CEILING),
         compressed: true,
-        summaryFallback: false,
       };
     } catch (error) {
       Logger.warning(`云端历史摘要失败，降级保留最近上下文: ${describeError(error)}`);
       return {
         messages: trimToTokenBudget(messages, CLOUD_RESTORE_DIRECT_TOKEN_BUDGET),
         compressed: true,
-        summaryFallback: true,
       };
     }
   }
@@ -422,10 +415,4 @@ function normalizeUID(value: unknown): string {
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function isTimeoutAbortReason(reason: unknown): boolean {
-  return !!reason
-    && typeof reason === 'object'
-    && (reason as { name?: unknown }).name === 'TimeoutError';
 }

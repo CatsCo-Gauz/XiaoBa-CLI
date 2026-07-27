@@ -8,6 +8,7 @@ import { resolveCatsCoRuntimeConfig } from '../catscompany/runtime-config';
 import { CatsCoConnectorLock, acquireCatsCoConnectorLock, isProcessAlive } from '../catscompany/connector-lock';
 import { PathResolver } from '../utils/path-resolver';
 import { prepareBoundBotDefinition } from '../bot-definition/activation';
+import { isRuntimeShutdownMessage } from '../utils/runtime-shutdown-message';
 import { createCatsCoLocalConfigService, type CatsCoAuthSnapshot } from '../catscompany/local-config';
 import {
   acknowledgeCloudBotModelSelection,
@@ -54,12 +55,7 @@ export async function catscompanyCommand(): Promise<void> {
     Logger.info(`CatsCo bot ${preparedBot.botId} 已在当前设备准备 ${preparedBot.definition.model.kind === 'catalog' ? preparedBot.definition.model.modelId : '模型'} 的运行材料。`);
   }
   const config = ConfigManager.getConfig();
-  const resolvedRuntime = resolveCatsCoRuntimeConfig({ runtimeRoot, env: process.env, config });
-  Object.assign(process.env, resolvedRuntime.envOverlay);
-  const resolved: CatsCoCommandConfigResolution = {
-    missing: resolvedRuntime.missing,
-    config: resolvedRuntime.connector,
-  };
+  const resolved = resolveCatsCoCommandConfig(config);
 
   const connectorConfig = resolved.config;
   if (!connectorConfig) {
@@ -125,6 +121,10 @@ export async function catscompanyCommand(): Promise<void> {
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+  process.on('message', message => {
+    if (isRuntimeShutdownMessage(message)) void shutdown();
+  });
+  process.on('disconnect', () => { void shutdown(); });
   process.on('exit', () => {
     lock?.release();
     lock = null;

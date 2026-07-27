@@ -14,9 +14,10 @@ export function isNativeFeishuGroupTrigger(
 }
 
 /**
- * Returns record-only Feishu group messages since the previous model trigger.
- * The server has already removed tool/runtime messages and messages targeting
- * another participant; this client-side pass keeps replay bounded and idempotent.
+ * Returns durable Feishu group messages since the previous model trigger.
+ * The server removes tool/runtime noise; every eligible participant message,
+ * including other Agents and messages mentioning someone else, remains context.
+ * This client-side pass only keeps replay bounded and idempotent.
  */
 export function selectNativeFeishuGroupContext(
   history: CatsAgentContextMessage[],
@@ -37,7 +38,10 @@ export function selectNativeFeishuGroupContext(
 function isEligibleParticipantMessage(message: CatsAgentContextMessage): boolean {
   return message.context_eligible === true
     && message.context_role === 'user'
-    && message.context_reason === 'participant_message';
+    // The trigger that already opened this Agent turn is stored separately;
+    // replaying it would duplicate the current root input. Other @ messages
+    // and other Agents' replies remain ordinary group context.
+    && message.context_reason !== 'group_message_targets_agent';
 }
 
 export function isNativeFeishuClearBoundary(message: CatsAgentContextMessage): boolean {

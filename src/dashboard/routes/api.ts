@@ -3006,7 +3006,7 @@ export function createApiRouter(
     try {
       const manager = new SkillManager();
       await manager.loadSkills();
-      const skill = manager.getSkill(req.params.name);
+      const skill = (await manager.resolveSkill(req.params.name))?.skill;
       if (!skill) return res.status(404).json({ error: 'Skill not found' });
       const management = getSkillManagementInfo(skill.filePath);
       res.json({
@@ -3026,7 +3026,7 @@ export function createApiRouter(
     try {
       const manager = new SkillManager();
       await manager.loadSkills();
-      const skill = manager.getSkill(req.params.name);
+      const skill = (await manager.resolveSkill(req.params.name))?.skill;
       if (!skill) {
         const disabled = findDisabledSkillByName(PathResolver.getSkillsPath(), req.params.name);
         if (disabled) {
@@ -3054,7 +3054,7 @@ export function createApiRouter(
     try {
       const manager = new SkillManager();
       await manager.loadSkills();
-      const skill = manager.getSkill(req.params.name);
+      const skill = (await manager.resolveSkill(req.params.name))?.skill;
       if (!skill) return res.status(404).json({ error: 'Skill not found' });
       const management = getSkillManagementInfo(skill.filePath);
       if (!management.canDisable) {

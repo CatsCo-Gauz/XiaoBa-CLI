@@ -1,8 +1,5 @@
 import { createCatsCoLocalConfigService, type CatsCoAuthSnapshot } from '../catscompany/local-config';
-import {
-  provisionCatsRelayCatalogRuntime,
-  refreshCatsRelayCatalogRuntimeCapabilities,
-} from '../catscompany/relay-model-bootstrap';
+import { provisionCatsRelayCatalogRuntime } from '../catscompany/relay-model-bootstrap';
 import { DEFAULT_CATSCO_RELAY_MODEL_ID } from '../utils/relay-model-profiles';
 import { Logger } from '../utils/logger';
 import {
@@ -252,12 +249,6 @@ export async function prepareBoundBotDefinition(
       if (activeCloudOverride) definitionService.storeCloudCatalogRuntime(materialized);
       else definitionService.storeCatalogRuntime(materialized);
       materializedCatalogRuntime = true;
-    } else if (catalogCapabilitiesNeedRefresh(runtime)) {
-      const refreshed = await refreshCatsRelayCatalogRuntimeCapabilities(runtime, options.fetchImpl ?? fetch);
-      if (refreshed !== runtime) {
-        if (activeCloudOverride) definitionService.storeCloudCatalogRuntime(refreshed);
-        else definitionService.storeCatalogRuntime(refreshed);
-      }
     }
   }
 
@@ -272,12 +263,6 @@ export async function prepareBoundBotDefinition(
     ...(cloudApplyError ? { cloudApplyError } : {}),
     ...(cloudSelectionApplied && cloudSelection ? { cloudRevision: cloudSelection.revision } : {}),
   };
-}
-
-function catalogCapabilitiesNeedRefresh(runtime: BotCatalogModelRuntime): boolean {
-  if (runtime.capabilitiesSource !== 'relay-models' || !runtime.capabilitiesCheckedAt) return true;
-  const checkedAt = Date.parse(runtime.capabilitiesCheckedAt);
-  return !Number.isFinite(checkedAt) || Date.now() - checkedAt >= 24 * 60 * 60 * 1000;
 }
 
 function errorMessage(error: unknown): string {

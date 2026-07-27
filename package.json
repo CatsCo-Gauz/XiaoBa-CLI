@@ -12,6 +12,7 @@
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
     "start:cli": "node dist/index.js",
+    "review:runtime": "tsx src/review/review-adapter-cli.ts",
     "electron:dev": "npm run build && node scripts/start-electron-dev.mjs",
     "electron:build": "npm run build && npm run prepare:runtime && npm run prune:electron-optionals && electron-builder --config electron-builder.config.cjs --publish never",
     "electron:build:mac": "npm run build && npm run prepare:runtime && npm run prune:electron-optionals && electron-builder --config electron-builder.config.cjs --mac --publish never",
@@ -116,6 +117,8 @@
       "!skills/**/*.pyc",
       "!skills/**/__pycache__/**",
       "skills/README.md",
+      "THIRD_PARTY_NOTICES.md",
+      "LICENSE",
       ".env.example",
       "package.json"
     ],

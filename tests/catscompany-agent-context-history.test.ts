@@ -88,6 +88,22 @@ describe('CatsCompany native Feishu group context', () => {
       },
       {
         seq_id: 6,
+        content: '@Wanyu 请先检查数据',
+        context_eligible: true,
+        context_role: 'user',
+        context_reason: 'participant_message',
+        metadata: { catsco_identity: nativeMetadata({ speaker: '布鲁斯' }).catsco_identity },
+      },
+      {
+        seq_id: 7,
+        content: '数据检查完成',
+        context_eligible: true,
+        context_role: 'user',
+        context_reason: 'other_agent_message',
+        metadata: { catsco_identity: nativeMetadata({ speaker: 'Wanyu' }).catsco_identity },
+      },
+      {
+        seq_id: 8,
         content: 'working...',
         context_eligible: false,
         context_role: 'assistant',
@@ -107,6 +123,8 @@ describe('CatsCompany native Feishu group context', () => {
     assert.deepEqual(context, [
       '[发言人: 陈大为]\n给我发一个 txt 文件',
       '[发言人: 林益]\n里面写一句诗',
+      '[发言人: 布鲁斯]\n@Wanyu 请先检查数据',
+      '[发言人: Wanyu]\n数据检查完成',
     ]);
   });
 

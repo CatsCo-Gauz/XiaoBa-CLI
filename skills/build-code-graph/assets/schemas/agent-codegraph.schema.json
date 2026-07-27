@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openai.local/build-code-graph/agent-codegraph.schema.json",
+  "title": "Agent Code Graph",
+  "type": "object",
+  "required": ["schemaVersion", "source", "project", "groups", "components", "edges", "flows", "layout", "diagnostics"],
+  "properties": {
+    "schemaVersion": { "const": "1.0" },
+    "source": { "type": "object" },
+    "project": {
+      "type": "object",
+      "required": ["name", "language", "locale"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "language": { "type": "string", "minLength": 1 },
+        "locale": { "type": "string", "minLength": 2 },
+        "description": { "type": "string" },
+        "sourceRoots": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": true
+    },
+    "groups": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "label"],
+        "properties": {
+          "id": { "$ref": "#/$defs/id" },
+          "label": { "type": "string", "minLength": 1 },
+          "summary": { "type": "string" }
+        },
+        "additionalProperties": true
+      }
+    },
+    "components": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "label", "group", "internalSteps", "internalEdges", "stats", "files"],
+        "properties": {
+          "id": { "$ref": "#/$defs/id" },
+          "label": { "type": "string", "minLength": 1 },
+          "summary": { "type": "string" },
+          "group": { "$ref": "#/$defs/id" },
+          "internalSteps": { "type": "array", "items": { "$ref": "#/$defs/internalStep" } },
+          "internalEdges": { "type": "array", "items": { "$ref": "#/$defs/internalEdge" } },
+          "stats": { "type": "object" },
+          "files": { "type": "array" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "edges": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "source", "target", "label", "kind", "semantic", "evidenceRequired", "references"],
+        "properties": {
+          "id": { "$ref": "#/$defs/id" },
+          "source": { "$ref": "#/$defs/id" },
+          "target": { "$ref": "#/$defs/id" },
+          "label": { "type": "string" },
+          "kind": { "$ref": "#/$defs/edgeKind" },
+          "payload": { "type": "string" },
+          "sourceStep": { "$ref": "#/$defs/id" },
+          "targetStep": { "$ref": "#/$defs/id" },
+          "semantic": { "type": "boolean" },
+          "evidenceRequired": { "type": "boolean" },
+          "references": { "type": "array", "items": { "type": "string" } },
+          "static": { "type": ["object", "null"] }
+        },
+        "additionalProperties": false
+      }
+    },
+    "flows": { "type": "array" },
+    "layout": { "type": "object" },
+    "diagnostics": { "type": "object" }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]*$"
+    },
+    "edgeKind": {
+      "enum": ["data", "control", "async", "init", "dependency"]
+    },
+    "internalEdge": {
+      "type": "object",
+      "required": ["source", "target"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "source": { "$ref": "#/$defs/id" },
+        "target": { "$ref": "#/$defs/id" },
+        "label": { "type": "string" },
+        "kind": { "$ref": "#/$defs/edgeKind" },
+        "payload": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "internalStep": {
+      "type": "object",
+      "required": ["id", "label"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "label": { "type": "string", "minLength": 1 },
+        "summary": { "type": "string" },
+        "file": { "type": "string" },
+        "symbol": { "type": "string" },
+        "tone": { "enum": ["entry", "process", "decision", "exit", "state"] },
+        "children": { "type": "array", "items": { "$ref": "#/$defs/internalStep" } },
+        "internalEdges": { "type": "array", "items": { "$ref": "#/$defs/internalEdge" } }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

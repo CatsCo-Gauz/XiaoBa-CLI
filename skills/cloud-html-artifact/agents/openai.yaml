@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cloud HTML Artifact"
+  short_description: "Publish existing HTML and mini apps to a verified cloud URL."
+  default_prompt: "Use $cloud-html-artifact to publish this existing HTML or supported mini-app directory to the configured cloud host, verify the public URL, and add it to the shared artifact index."
