@@ -1,5 +1,6 @@
 import * as path from 'path';
 import * as fs from 'fs';
+import * as dotenv from 'dotenv';
 
 /** Default sub-directory under the skills root for generated distilled skills. */
 export const GENERATED_DISTILLED_DIR_NAME = 'generated-distilled';
@@ -14,13 +15,14 @@ export class PathResolver {
     env: NodeJS.ProcessEnv = process.env,
     cwd: string = process.cwd(),
   ): string {
+    const dotenvValues = this.loadDotenvValues(cwd, env);
     const explicit = [
-      env.XIAOBA_USER_DATA_DIR,
-      env.CATSCO_USER_DATA_DIR,
-      env.XIAOBA_ELECTRON_USER_DATA_DIR,
+      env.XIAOBA_USER_DATA_DIR ?? dotenvValues.XIAOBA_USER_DATA_DIR,
+      env.CATSCO_USER_DATA_DIR ?? dotenvValues.CATSCO_USER_DATA_DIR,
+      env.XIAOBA_ELECTRON_USER_DATA_DIR ?? dotenvValues.XIAOBA_ELECTRON_USER_DATA_DIR,
       // Legacy data-root compatibility only. Bundled executable discovery uses
       // XIAOBA_BUNDLED_EXECUTABLES_DIR and must not write this variable.
-      env.XIAOBA_RUNTIME_ROOT,
+      env.XIAOBA_RUNTIME_ROOT ?? dotenvValues.XIAOBA_RUNTIME_ROOT,
     ]
       .map(value => String(value || '').trim())
       .find(Boolean);
@@ -28,12 +30,25 @@ export class PathResolver {
     return path.resolve(explicit || cwd);
   }
 
+  private static loadDotenvValues(cwd: string, env: NodeJS.ProcessEnv): Record<string, string> {
+    const envPath = env.DOTENV_CONFIG_PATH || path.join(cwd, '.env');
+    if (!fs.existsSync(envPath)) return {};
+    try {
+      return dotenv.parse(fs.readFileSync(envPath, 'utf8'));
+    } catch {
+      return {};
+    }
+  }
+
   static getDataPath(...segments: string[]): string {
     return path.join(this.getRuntimeDataRoot(), 'data', ...segments);
   }
 
-  static getSessionLogAppendSignalPath(runtimeRoot: string = process.cwd()): string {
-    return path.join(this.getRuntimeDataRoot(process.env, runtimeRoot), 'data', 'session-log-append.signal');
+  static getSessionLogAppendSignalPath(runtimeRoot?: string): string {
+    const resolvedRoot = runtimeRoot
+      ? path.resolve(runtimeRoot)
+      : this.getRuntimeDataRoot();
+    return path.join(resolvedRoot, 'data', 'session-log-append.signal');
   }
 
   static getLogsPath(...segments: string[]): string {

@@ -16,9 +16,11 @@
  * See ADR 0001 → "Runtime Heartbeat Log Distillation".
  */
 
+import * as fs from 'fs';
 import { getDistillationHeartbeatConfig } from './distillation-heartbeat-config';
 import type { DueWorkPlanner } from './due-work-planner';
 import { Logger } from './logger';
+import { PathResolver } from './path-resolver';
 import type { HeartbeatSchedulerOwnerLock } from './heartbeat-scheduler-owner-lock';
 import type { RuntimeLearning } from './runtime-learning';
 import type {
@@ -36,6 +38,7 @@ import type {
 
 const MIN_TIMEOUT_MS = 60 * 1000;
 const MAX_TIMEOUT_MS = 2_147_483_647;
+const SESSION_LOG_APPEND_DEBOUNCE_MS = 1_000;
 /**
  * Minimum delay before a deadline-driven reschedule when the planner
  * returns a due item already in the past. Without this floor, a
@@ -87,6 +90,9 @@ export class DistillationHeartbeatScheduler {
   private readonly runtimeLearning: RuntimeLearning;
   private readonly ownerLock: HeartbeatSchedulerOwnerLock | null;
   private timer: NodeJS.Timeout | null = null;
+  private sessionLogAppendWakeTimer: NodeJS.Timeout | null = null;
+  private sessionLogAppendSignalPath: string | null = null;
+  private sessionLogAppendSignalListener: ((current: fs.Stats, previous: fs.Stats) => void) | null = null;
   private started = false;
   private stopped = false;
   private readonly pendingWakeReasons = new Set<RuntimeLearningReason>();
@@ -155,9 +161,15 @@ export class DistillationHeartbeatScheduler {
 
     this.started = true;
     this.stopped = false;
-    for (const reason of this.runtimeLearning?.getPendingHeartbeatReasons?.() ?? []) {
+    const heartbeat = this.runtimeLearning?.loadHeartbeatRecord?.();
+    for (const reason of [
+      ...(this.runtimeLearning?.getPendingHeartbeatReasons?.() ?? []),
+      ...(heartbeat?.inProgress?.reasons ?? []),
+    ]) {
       this.pendingWakeReasons.add(reason);
     }
+    this.persistPendingWakeReasons();
+    this.startSessionLogAppendWatcher();
     Logger.info('[DistillationHeartbeat] scheduler started');
 
     const startupWake = (async () => {
@@ -173,6 +185,7 @@ export class DistillationHeartbeatScheduler {
   async stop(): Promise<boolean> {
     this.stopped = true;
     this.started = false;
+    this.stopSessionLogAppendWatcher();
     this.consecutiveImmediateReschedules = 0;
     const stopStartedAtMs = Date.now();
     const sharedReviewDeadlineMs = this.getSharedReviewDeadlineMs();
@@ -264,9 +277,11 @@ export class DistillationHeartbeatScheduler {
       const remainingMs = Math.max(1, sharedReviewDeadlineMs - (Date.now() - stopStartedAtMs));
       let runtimeDrainTimer: NodeJS.Timeout | null = null;
       let runtimeDrainCompleted = false;
+      let runtimeDrained = false;
       await Promise.race([
-        runtimeDrain.then(() => {
+        runtimeDrain.then(drained => {
           runtimeDrainCompleted = true;
+          runtimeDrained = drained !== false;
         }).finally(() => {
           if (runtimeDrainTimer) {
             clearTimeout(runtimeDrainTimer);
@@ -277,7 +292,18 @@ export class DistillationHeartbeatScheduler {
           runtimeDrainTimer = setTimeout(resolve, remainingMs);
         }),
       ]);
-      if (!runtimeDrainCompleted) cleanShutdown = false;
+      if (!runtimeDrainCompleted || !runtimeDrained) {
+        cleanShutdown = false;
+        const waitForDrain = this.runtimeLearning?.waitForDrain;
+        if (typeof waitForDrain === 'function') {
+          // Keep the process-wide writer lease until an over-deadline backfill
+          // or wake actually leaves the RuntimeLearning writer boundary.
+          void waitForDrain.call(this.runtimeLearning).then(
+            () => this.ownerLock?.release(),
+            () => this.ownerLock?.release(),
+          );
+        }
+      }
     }
 
     Logger.info('[DistillationHeartbeat] scheduler stopped');
@@ -324,8 +350,6 @@ export class DistillationHeartbeatScheduler {
       let isCoalescedWake = false;
       while (!this.stopped && this.pendingWakeReasons.size > 0) {
           const nextReasons = [...this.pendingWakeReasons];
-          this.pendingWakeReasons.clear();
-          this.persistPendingWakeReasons();
           try {
             this.runtimeLearning.markHeartbeatInProgress?.(
               nextReasons,
@@ -336,6 +360,8 @@ export class DistillationHeartbeatScheduler {
                 lastHeartbeatAt: this.ownerLock.record.lastHeartbeatAt,
               } : undefined,
             );
+            this.pendingWakeReasons.clear();
+            this.persistPendingWakeReasons();
             lastResult = await this.runtimeLearning.wake(nextReasons, { coalesced: isCoalescedWake });
             isCoalescedWake = true;
             for (const pending of this.runtimeLearning.getPendingHeartbeatReasons?.() ?? []) {
@@ -362,6 +388,80 @@ export class DistillationHeartbeatScheduler {
     }
   }
 
+  /**
+   * Request an owner wake without coupling appenders to RuntimeLearning.
+   * Session-log requests are durably marked immediately and coalesced into a
+   * single discovery wake per debounce window.
+   */
+  requestWake(reason: RuntimeLearningReason = 'session-log-append'): void {
+    this.pendingWakeReasons.add(reason);
+    this.persistPendingWakeReasons();
+    if (this.stopped || !this.started) return;
+
+    if (reason !== 'session-log-append') {
+      void this.runHeartbeat(reason).catch(error => {
+        Logger.warning(`[DistillationHeartbeat] requested wake failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
+      return;
+    }
+
+    if (this.sessionLogAppendWakeTimer) return;
+    this.sessionLogAppendWakeTimer = setTimeout(() => {
+      this.sessionLogAppendWakeTimer = null;
+      void this.runHeartbeat('session-log-append')
+        .then(() => this.rescheduleAfterEventWake())
+        .catch(error => {
+          Logger.warning(`[DistillationHeartbeat] session append wake failed: ${error instanceof Error ? error.message : String(error)}`);
+        });
+    }, SESSION_LOG_APPEND_DEBOUNCE_MS);
+    this.sessionLogAppendWakeTimer.unref?.();
+  }
+
+  private startSessionLogAppendWatcher(): void {
+    if (this.sessionLogAppendSignalListener) return;
+    const runtimeRoot = PathResolver.getRuntimeDataRoot(process.env, this.workingDirectory);
+    const signalPath = PathResolver.getSessionLogAppendSignalPath(runtimeRoot);
+    this.sessionLogAppendSignalPath = signalPath;
+    this.sessionLogAppendSignalListener = (current, previous) => {
+      if (
+        current.mtimeMs === previous.mtimeMs
+        && current.ctimeMs === previous.ctimeMs
+        && current.ino === previous.ino
+      ) {
+        return;
+      }
+      this.requestWake('session-log-append');
+    };
+    fs.watchFile(
+      signalPath,
+      { interval: 250, persistent: false },
+      this.sessionLogAppendSignalListener,
+    );
+  }
+
+  private stopSessionLogAppendWatcher(): void {
+    if (this.sessionLogAppendWakeTimer) {
+      clearTimeout(this.sessionLogAppendWakeTimer);
+      this.sessionLogAppendWakeTimer = null;
+    }
+    if (!this.sessionLogAppendSignalListener || !this.sessionLogAppendSignalPath) return;
+    fs.unwatchFile(
+      this.sessionLogAppendSignalPath,
+      this.sessionLogAppendSignalListener,
+    );
+    this.sessionLogAppendSignalListener = null;
+    this.sessionLogAppendSignalPath = null;
+  }
+
+  private rescheduleAfterEventWake(): void {
+    if (this.stopped || !this.started) return;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    this.scheduleNextRun();
+  }
+
   private persistPendingWakeReasons(): void {
     this.runtimeLearning?.markHeartbeatPending?.(
       Array.from(this.pendingWakeReasons).sort(),
@@ -374,6 +474,10 @@ export class DistillationHeartbeatScheduler {
 
   private scheduleNextRun(): void {
     if (this.stopped) return;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
 
     const config = getDistillationHeartbeatConfig(this.workingDirectory);
     const intervalDelay = Math.min(
