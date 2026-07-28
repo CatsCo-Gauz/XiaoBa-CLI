@@ -14,6 +14,7 @@ import {
   semanticReassessmentTaskId,
   shouldReassessCurrentSkill,
 } from './semantic-reassessment';
+import { semanticPriorGuidanceEvidenceRef } from './evidence-bundle-authority';
 
 export interface SemanticReassessmentBootstrapOptions {
   skillEvolution: SkillEvolutionRuntime;
@@ -235,10 +236,20 @@ async function reassessRecord(
     return { taskId: entry.taskId, capabilityHandle: record.handle, status: 'deferred', errorMessage: current?.lastError };
   }
   const evidenceRefs = record.evidenceRefs.map(item => item.ref);
-  const completionRef = evidenceRefs[0] ?? `registry:${record.handle}:guidance`;
-  const settlementRef = evidenceRefs[1] ?? `registry:${record.handle}:reassessment`;
+  const priorGuidanceBasis = freezeSemanticPriorGuidanceBasis(record, observations);
+  const completionRef = priorGuidanceBasis?.completionEvidence[0]?.ref
+    ?? evidenceRefs[0]
+    ?? `registry:${record.handle}:guidance`;
+  const settlementRef = priorGuidanceBasis?.settlementEvidence[0]?.ref
+    ?? evidenceRefs[1]
+    ?? `registry:${record.handle}:reassessment`;
+  const reviewEvidenceRefs = [completionRef, settlementRef];
   const bundle: EvidenceBundle = {
     bundleId: semanticReassessmentTaskId(record.handle, record.guidanceHash, observations),
+    authority: {
+      kind: 'semantic-reassessment',
+      targetCapabilityHandle: record.handle,
+    },
     // Reassessment still enters the normal review/queue seam, which expects
     // a DistilledKnowledgeCandidate. Keep the capability handle alongside
     // the candidate fields so constrained fixtures and audit consumers can
@@ -259,7 +270,7 @@ async function reassessRecord(
         verification: 'The bounded reassessment review completed.',
         noCorrection: 'Prior evidence remains the fixed source for reassessment.',
       },
-      provenance: evidenceRefs.map((ref, index) => ({
+      provenance: reviewEvidenceRefs.map((ref, index) => ({
         filePath: ref,
         turn: index + 1,
         role: index === 0 ? 'problem-action' as const : 'verification' as const,
@@ -272,18 +283,20 @@ async function reassessRecord(
         generatedAt: new Date().toISOString(),
       },
     } as import('./capability-distiller').DistilledKnowledgeCandidate & { capabilityHandle: string },
-    completionEvidence: [{ ref: completionRef }],
-    settlementEvidence: [{ ref: settlementRef === completionRef ? `${settlementRef}:settlement` : settlementRef }],
+    completionEvidence: priorGuidanceBasis?.completionEvidence ?? [{ ref: completionRef }],
+    settlementEvidence: priorGuidanceBasis?.settlementEvidence
+      ?? [{ ref: settlementRef === completionRef ? `${settlementRef}:settlement` : settlementRef }],
     boundedContinuity: [],
     semanticObservations: observations,
     referencedSkills: options.references ?? record.referencedSkills,
-    relatedCurrentSkills: Object.values(options.registry.capabilities).map(item => ({
-      handle: item.handle,
-      revision: item.revision,
-      routingName: item.routingName,
-      description: item.description,
-      guidanceHash: item.guidanceHash,
-    })),
+    relatedCurrentSkills: [{
+      handle: record.handle,
+      revision: record.revision,
+      routingName: record.routingName,
+      description: record.description,
+      guidanceHash: record.guidanceHash,
+    }],
+    ...(priorGuidanceBasis ? { sourceEvidence: priorGuidanceBasis.sourceEvidence } : {}),
   };
   // The Job store is authoritative. Rebuild the manifest mirror before any
   // submission so a crash after terminal Job persistence cannot re-admit the
@@ -350,6 +363,59 @@ async function reassessRecord(
       options.manifest.save(state);
     }
     return { taskId: entry.taskId, capabilityHandle: record.handle, status: 'failed', errorMessage: message };
+  }
+}
+
+function freezeSemanticPriorGuidanceBasis(
+  record: ReturnType<SkillEvolutionRuntime['getRegistry']>['capabilities'][string],
+  observations: readonly import('./learning-episode').SemanticObservation[],
+): Pick<EvidenceBundle, 'completionEvidence' | 'settlementEvidence' | 'sourceEvidence'> | undefined {
+  try {
+    const fileContent = fs.readFileSync(record.skillFilePath, 'utf8');
+    if (crypto.createHash('sha256').update(fileContent).digest('hex') !== record.guidanceHash) {
+      return undefined;
+    }
+    const guidanceBody = SkillParser.parse(record.skillFilePath).content.trim();
+    if (!guidanceBody) return undefined;
+    const guidanceContentHash = crypto.createHash('sha256').update(guidanceBody).digest('hex');
+    if (
+      record.guidanceContentHash !== undefined
+      && record.guidanceContentHash !== guidanceContentHash
+    ) return undefined;
+
+    const guidanceRef = semanticPriorGuidanceEvidenceRef(record.handle, record.guidanceHash);
+    const observationRef = `registry:${record.handle}:semantic-observations:${semanticObservationHash(observations)}`;
+    const observationContent = JSON.stringify(observations);
+    return {
+      completionEvidence: [{
+        ref: guidanceRef,
+        sourceFilePath: record.skillFilePath,
+        turn: 0,
+      }],
+      settlementEvidence: [{
+        ref: observationRef,
+        sourceFilePath: `registry:${record.handle}`,
+        turn: 0,
+      }],
+      sourceEvidence: [
+        {
+          ref: guidanceRef,
+          role: 'problem-action',
+          content: guidanceBody,
+          sourceFilePath: record.skillFilePath,
+          turn: 0,
+        },
+        {
+          ref: observationRef,
+          role: 'verification',
+          content: observationContent,
+          sourceFilePath: `registry:${record.handle}`,
+          turn: 0,
+        },
+      ],
+    };
+  } catch {
+    return undefined;
   }
 }
 

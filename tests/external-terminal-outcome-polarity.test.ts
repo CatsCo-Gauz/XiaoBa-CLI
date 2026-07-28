@@ -70,6 +70,34 @@ function episodeAssistantEvidence(unit: DistillationUnit) {
 }
 
 describe('External terminal-outcome polarity (RC #6)', () => {
+  test('a substantive final without success keywords remains a review candidate', () => {
+    const unit = externalUnit(
+      'Here is the requested report with the package findings and the recommended exclusion.',
+    );
+    const evidence = episodeAssistantEvidence(unit);
+    assert.ok(evidence.length > 0, 'absence of a success keyword is not a definite reason to discard evidence');
+  });
+
+  test('a context-free continuation does not seed an external episode', () => {
+    const unit = externalUnit('Here is the next part of the discussion.', 'continue');
+    const evidence = episodeAssistantEvidence(unit);
+    assert.equal(evidence.length, 0);
+  });
+
+  test('an explicit unfinished progress tail does not seed an external episode', () => {
+    const unit = externalUnit('Exploring the codebase now. Let me add the regression test next.');
+    const evidence = episodeAssistantEvidence(unit);
+    assert.equal(evidence.length, 0);
+  });
+
+  test('earlier progress does not erase a later substantive final', () => {
+    const unit = externalUnit(
+      'I am investigating the package first. Here is the requested report with the findings and recommended exclusion.',
+    );
+    const evidence = episodeAssistantEvidence(unit);
+    assert.ok(evidence.length > 0);
+  });
+
   test('a genuinely successful outcome tail admits an external episode', () => {
     const unit = externalUnit(
       'Removed the VS Code cask and 19 extensions, ran `brew bundle`, and all checks passed. The package is OK and ready.',
@@ -96,6 +124,24 @@ describe('External terminal-outcome polarity (RC #6)', () => {
     );
     const evidence = episodeAssistantEvidence(unit);
     assert.equal(evidence.length, 0, 'negated validation must not count as a successful final');
+  });
+
+  test('Chinese explicit failure tails are vetoed', () => {
+    for (const tail of [
+      '测试失败，暂时无法完成交付。',
+      '验证失败，遇到错误，无法完成。',
+      '实现过程中发生错误，尚未完成。',
+    ]) {
+      const evidence = episodeAssistantEvidence(externalUnit(tail));
+      assert.equal(evidence.length, 0, `explicit Chinese failure must veto admission: ${tail}`);
+    }
+  });
+
+  test('Chinese failure followed by a final success remains order-sensitive', () => {
+    const evidence = episodeAssistantEvidence(externalUnit(
+      '第一次测试失败，随后修复了配置，最终测试通过，已经完成交付。',
+    ));
+    assert.ok(evidence.length > 0, 'a later explicit success should clear an earlier failure');
   });
 
   test('negative-then-corrected: last positive outcome wins (order-sensitive)', () => {

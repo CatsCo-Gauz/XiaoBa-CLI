@@ -18,7 +18,6 @@ export const SKILL_USAGE_CURATOR_SCHEMA_VERSION = 1 as const;
 export interface CuratorReassessment {
   skill: GeneratedCurrentSkillIdentity;
   outcomeFacts: SkillUsageOutcomeFact[];
-  expedited: boolean;
   bundle: EvidenceBundle;
 }
 
@@ -28,8 +27,6 @@ export interface SkillUsageCuratorOptions {
   intervalMs: number;
   runtime?: SkillEvolutionRuntime;
   reassess?: (request: CuratorReassessment) => Promise<CapabilityTransitionKind>;
-  successThreshold?: number;
-  deferThreshold?: number;
   now?: () => Date;
 }
 
@@ -49,7 +46,6 @@ interface CuratorState {
   schemaVersion: typeof SKILL_USAGE_CURATOR_SCHEMA_VERSION;
   lastRoutineRunAt: string | null;
   reviewedOutcomeFactIds: string[];
-  observedEpisodeIds: string[];
   expedited: Record<string, CuratorWake>;
 }
 
@@ -60,45 +56,34 @@ interface CuratorState {
  */
 export class SkillUsageCurator {
   private readonly now: () => Date;
-  private readonly successThreshold: number;
-  private readonly deferThreshold: number;
 
   constructor(private readonly options: SkillUsageCuratorOptions) {
     this.now = options.now ?? (() => new Date());
-    this.successThreshold = Math.max(1, options.successThreshold ?? 2);
-    this.deferThreshold = Math.max(1, options.deferThreshold ?? 2);
   }
 
   /**
    * Return runtime-owned `GeneratedSkillLoadFact` entries tied to one episode
-   * by the canonical AgentTurn correlation. This is the trusted dependency
-   * fact seam for Evidence Bundle construction — it is never derived from
-   * untrusted external/capsule semantic content.
+   * by both canonical AgentTurn and runtime-session identity. This is the
+   * trusted dependency fact seam for Evidence Bundle construction — it is
+   * never derived from untrusted external/capsule semantic content.
    */
-  listLoadFactsForEpisode(episodeId: string): readonly GeneratedSkillLoadFact[] {
+  listLoadFactsForEpisode(
+    episode: Pick<LearningEpisode, 'agentTurnEpisodeId' | 'runtimeSessionId'>,
+  ): readonly GeneratedSkillLoadFact[] {
+    if (!episode.agentTurnEpisodeId || !episode.runtimeSessionId) return [];
     return this.options.ledger
       .listFacts()
       .filter((fact): fact is GeneratedSkillLoadFact =>
-        fact.kind === 'generated-skill-load' && fact.episodeId === episodeId,
+        fact.kind === 'generated-skill-load'
+        && fact.episodeId === episode.agentTurnEpisodeId
+        && fact.runtimeSessionId === episode.runtimeSessionId,
       );
   }
 
   observeEpisode(episode: LearningEpisode): SkillUsageOutcomeFact[] {
-    const state = this.loadState();
-    // Skip if already observed (idempotent)
-    if (state.observedEpisodeIds.includes(episode.episodeId)) {
-      return [];
-    }
     const facts = this.options.ledger.recordEpisodeOutcome(episode, this.now());
-    // Track as observed
-    state.observedEpisodeIds.push(episode.episodeId);
-    this.saveState(state);
     for (const fact of facts) if (fact.outcome === 'contradicted') this.requestExpeditedWake(fact);
     return facts;
-  }
-
-  recordDeferredOutcome(episodeId: string, evidenceRefs: readonly string[]): SkillUsageOutcomeFact[] {
-    return this.options.ledger.recordOutcome({ episodeId, outcome: 'deferred', evidenceRefs, recordedAt: this.now() });
   }
 
   requestExpeditedWake(outcome: SkillUsageOutcomeFact): void {
@@ -119,6 +104,44 @@ export class SkillUsageCurator {
     return Object.values(this.loadState().expedited);
   }
 
+  /**
+   * Rebuild expedited wake state from durable ledger facts.
+   *
+   * The outcome append and curator-state rename are separate durable writes.
+   * A process can stop between them, so the JSONL ledger is the source of
+   * truth and the wake map is a rebuildable scheduling projection.
+   */
+  recoverExpeditedWakes(): void {
+    const state = this.loadState();
+    const facts = this.options.ledger.listFacts();
+    const loads = new Map(
+      facts
+        .filter((fact): fact is GeneratedSkillLoadFact => fact.kind === 'generated-skill-load')
+        .map(fact => [fact.factId, fact]),
+    );
+    let changed = false;
+
+    for (const outcome of facts) {
+      if (
+        outcome.kind !== 'episode-outcome'
+        || outcome.outcome !== 'contradicted'
+        || state.reviewedOutcomeFactIds.includes(outcome.factId)
+      ) continue;
+      const load = loads.get(outcome.loadFactId);
+      if (!load) continue;
+      const existing = state.expedited[load.skill.capabilityHandle];
+      if (existing?.outcomeFactIds.includes(outcome.factId)) continue;
+      state.expedited[load.skill.capabilityHandle] = {
+        capabilityHandle: load.skill.capabilityHandle,
+        outcomeFactIds: [...new Set([...(existing?.outcomeFactIds ?? []), outcome.factId])],
+        requestedAt: existing?.requestedAt ?? this.now().toISOString(),
+      };
+      changed = true;
+    }
+
+    if (changed) this.saveState(state);
+  }
+
   async runDue(): Promise<CuratorRunResult> {
     const state = this.loadState();
     const now = this.now();
@@ -129,9 +152,11 @@ export class SkillUsageCurator {
 
     const facts = this.options.ledger.listFacts();
     const loads = new Map(facts.filter(fact => fact.kind === 'generated-skill-load').map(fact => [fact.factId, fact]));
-    const outcomes = facts.filter((fact): fact is SkillUsageOutcomeFact => fact.kind === 'episode-outcome');
+    const outcomes = facts.filter((fact): fact is SkillUsageOutcomeFact => (
+      fact.kind === 'episode-outcome' && fact.outcome === 'contradicted'
+    ));
     const current = this.options.runtime?.getRegistry().capabilities ?? {};
-    const selected = new Map<string, { skill: GeneratedCurrentSkillIdentity; outcomes: SkillUsageOutcomeFact[]; expedited: boolean }>();
+    const selected = new Map<string, { skill: GeneratedCurrentSkillIdentity; outcomes: SkillUsageOutcomeFact[] }>();
     const obsoleteOutcomeFactIds: string[] = [];
     const obsoleteHandles = new Set<string>();
 
@@ -147,10 +172,25 @@ export class SkillUsageCurator {
       const entry = selected.get(load.skill.capabilityHandle) ?? {
         skill: load.skill,
         outcomes: [],
-        expedited: expeditedHandles.has(load.skill.capabilityHandle),
       };
       entry.outcomes.push(outcome);
       selected.set(load.skill.capabilityHandle, entry);
+    }
+
+    // `reviewedOutcomeFactIds` suppresses identical wake/review work; it must
+    // not erase factual contradiction history after a semantic defer. Once a
+    // new outcome triggers this handle, rebuild the fixed bundle from every
+    // contradiction still bound to the active revision so evidence accumulates
+    // without adding a second curator lifecycle or retry ledger.
+    for (const [capabilityHandle, selection] of selected) {
+      selection.outcomes = outcomes.filter(outcome => {
+        const load = loads.get(outcome.loadFactId);
+        const currentSkill = load && current[capabilityHandle];
+        return !!load
+          && load.skill.capabilityHandle === capabilityHandle
+          && !!currentSkill
+          && isCurrentSkillIdentity(currentSkill, load.skill);
+      });
     }
 
     // Ledger facts remain durable historical evidence, but outcomes linked to
@@ -163,25 +203,12 @@ export class SkillUsageCurator {
 
     const transitions: CuratorRunResult['transitions'] = [];
     for (const [capabilityHandle, selection] of selected) {
-      const contradictions = selection.outcomes.some(outcome => outcome.outcome === 'contradicted');
-      const successes = selection.outcomes.filter(outcome => outcome.outcome === 'verified-success').length;
-      const defers = selection.outcomes.filter(outcome => outcome.outcome === 'deferred').length;
-      if (!selection.expedited && !contradictions && successes < this.successThreshold && defers < this.deferThreshold) continue;
       const request: CuratorReassessment = {
         skill: selection.skill,
         outcomeFacts: selection.outcomes,
-        expedited: selection.expedited || contradictions,
         bundle: this.buildEvidenceBundle(selection.skill, selection.outcomes),
       };
       const transition = await this.reassess(request);
-      if (transition === 'defer') {
-        for (const outcome of selection.outcomes) {
-          this.recordDeferredOutcome(outcome.episodeId, [
-            ...outcome.evidenceRefs,
-            `usage-curation:${outcome.factId}`,
-          ]);
-        }
-      }
       transitions.push({ capabilityHandle, transition });
       state.reviewedOutcomeFactIds = [...new Set([...state.reviewedOutcomeFactIds, ...selection.outcomes.map(item => item.factId)])];
       delete state.expedited[capabilityHandle];
@@ -223,6 +250,10 @@ export class SkillUsageCurator {
     ];
     return {
       bundleId: `usage-curation:${skill.capabilityHandle}:${outcomes.map(item => item.factId).sort().join(',')}`,
+      authority: {
+        kind: 'usage-reassessment',
+        targetCapabilityHandle: skill.capabilityHandle,
+      },
       episode: {
         kind: 'usage-reassessment',
         capabilityHandle: skill.capabilityHandle,
@@ -239,13 +270,16 @@ export class SkillUsageCurator {
       settlementEvidence,
       boundedContinuity: [],
       referencedSkills: record?.referencedSkills ?? [],
-      relatedCurrentSkills: Object.values(registry?.capabilities ?? {}).map(item => ({
-        handle: item.handle,
-        revision: item.revision,
-        routingName: item.routingName,
-        description: item.description,
-        guidanceHash: item.guidanceHash,
-      })),
+      // A usage correction is already bound to one runtime-owned load fact.
+      // Keep the fixed review basis single-target: unrelated Registry entries
+      // add prompt noise and can make the first entry look like the target.
+      relatedCurrentSkills: record ? [{
+        handle: record.handle,
+        revision: record.revision,
+        routingName: record.routingName,
+        description: record.description,
+        guidanceHash: record.guidanceHash,
+      }] : [],
       sourceEvidence,
     };
   }
@@ -255,10 +289,6 @@ export class SkillUsageCurator {
     try {
       const state = JSON.parse(fs.readFileSync(this.options.statePath, 'utf8')) as CuratorState;
       if (state.schemaVersion !== SKILL_USAGE_CURATOR_SCHEMA_VERSION || !Array.isArray(state.reviewedOutcomeFactIds) || !state.expedited) throw new Error('invalid state');
-      // Migrate: add observedEpisodeIds if missing (backward compatibility)
-      if (!Array.isArray(state.observedEpisodeIds)) {
-        state.observedEpisodeIds = [];
-      }
       return state;
     } catch {
       return emptyState();
@@ -287,7 +317,6 @@ function emptyState(): CuratorState {
     schemaVersion: SKILL_USAGE_CURATOR_SCHEMA_VERSION,
     lastRoutineRunAt: null,
     reviewedOutcomeFactIds: [],
-    observedEpisodeIds: [],
     expedited: {},
   };
 }

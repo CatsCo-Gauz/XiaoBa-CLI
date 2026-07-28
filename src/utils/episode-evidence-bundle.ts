@@ -14,6 +14,11 @@
  * the bottom of `runtime-learning.ts`.
  */
 
+import {
+  MAX_LEARNING_EPISODE_SOURCE_EVIDENCE_CONTENT_BYTES,
+  MAX_LEARNING_EPISODE_SOURCE_EVIDENCE_ENTRIES,
+  MAX_LEARNING_EPISODE_SOURCE_EVIDENCE_PAYLOAD_BYTES,
+} from './learning-episode';
 import type { LearningEpisode, LearningEpisodeStatus } from './learning-episode';
 import type { DistilledKnowledgeCandidate } from './capability-distiller';
 import type { SkillEvolutionRuntime } from './skill-evolution';
@@ -26,9 +31,11 @@ import type {
   SkillEvidenceRef,
   TrustedReferencedSkillIdentity,
 } from './skill-evolution';
+import { validateFrozenSourceEvidence } from './frozen-source-evidence';
 import type { EvidenceCapsuleStore } from './evidence-capsule';
 import { reconstructBundleFromCapsule } from './evidence-capsule';
 import type { GeneratedSkillLoadFact } from './skill-usage-ledger';
+import { containsExactStableIdentifier } from './evidence-bundle-authority';
 
 // Re-export the bundle-related types that RuntimeLearning previously
 // re-exported from its tail, so external consumers can still reach them through
@@ -46,6 +53,19 @@ export interface EpisodeSettlementEvidence {
   readonly content: string;
   readonly sourceFilePath: string;
   readonly turn: number;
+  readonly byteRange?: { start: number; end: number };
+}
+
+/**
+ * Raised when a pre-snapshot local Episode reaches review. Re-reading its log
+ * would make retries mutable; using `detail` would manufacture source content
+ * from a summary. Callers must leave such Episodes outside review admission.
+ */
+export class MissingLearningEpisodeSourceEvidenceError extends Error {
+  constructor(episodeId: string, reason = 'has no frozen source evidence') {
+    super(`Learning Episode ${episodeId} ${reason}; review admission is fail-closed.`);
+    this.name = 'MissingLearningEpisodeSourceEvidenceError';
+  }
 }
 
 /**
@@ -73,7 +93,7 @@ export interface EpisodeSettlementEvidence {
 export function buildEpisodeSettlementEvidence(
   episode: Pick<
     LearningEpisode,
-    'episodeId' | 'sourceFilePath' | 'settlementDeadline' | 'deliveryTurn' | 'status'
+    'episodeId' | 'sourceFilePath' | 'settlementDeadline' | 'deliveryTurn' | 'status' | 'unitByteRange'
   >,
 ): EpisodeSettlementEvidence {
   const ref = `${episode.sourceFilePath}#episode-${episode.episodeId}:settlement-${episode.settlementDeadline}`;
@@ -86,11 +106,58 @@ export function buildEpisodeSettlementEvidence(
     content,
     sourceFilePath: episode.sourceFilePath,
     turn: episode.deliveryTurn,
+    ...(episode.unitByteRange ? { byteRange: episode.unitByteRange } : {}),
   };
 }
 
 function isSettledStatus(status: LearningEpisodeStatus): boolean {
   return status === 'eligible' || status === 'contradicted';
+}
+
+function buildLocalSourceEvidence(
+  episode: LearningEpisode,
+  completionEvidence: readonly SkillEvidenceRef[],
+  settlementEntry: EpisodeSettlementEvidence,
+): readonly BoundedSourceEvidence[] {
+  const settlementSource: BoundedSourceEvidence = {
+    ref: settlementEntry.ref,
+    role: 'verification',
+    content: settlementEntry.content,
+    sourceFilePath: settlementEntry.sourceFilePath,
+    turn: settlementEntry.turn,
+    ...(settlementEntry.byteRange ? { byteRange: settlementEntry.byteRange } : {}),
+  };
+  const failure = validateFrozenSourceEvidence(
+    {
+      completionEvidence,
+      settlementEvidence: [],
+      sourceEvidence: episode.sourceEvidence,
+    },
+    {
+      maxEntries: MAX_LEARNING_EPISODE_SOURCE_EVIDENCE_ENTRIES,
+      maxPayloadBytes: MAX_LEARNING_EPISODE_SOURCE_EVIDENCE_PAYLOAD_BYTES,
+      maxContentBytes: MAX_LEARNING_EPISODE_SOURCE_EVIDENCE_CONTENT_BYTES,
+      requireMetadataMatch: true,
+      requireSettlementCoverage: false,
+    },
+  );
+  if (failure) {
+    const detail = failure.code === 'missing'
+      ? 'has no frozen source evidence'
+      : failure.code === 'oversized'
+        ? 'has oversized frozen source evidence'
+        : failure.code === 'duplicate'
+          ? `has duplicate frozen source evidence for ${failure.ref ?? 'an evidence ref'}`
+          : `has no matching frozen source content for ${failure.ref ?? 'an evidence ref'}`;
+    throw new MissingLearningEpisodeSourceEvidenceError(episode.episodeId, detail);
+  }
+  const byRef = new Map<string, BoundedSourceEvidence>();
+  for (const source of episode.sourceEvidence ?? []) byRef.set(source.ref, source);
+
+  return [
+    ...completionEvidence.map(ref => ({ ...byRef.get(ref.ref)! })),
+    settlementSource,
+  ];
 }
 
 /**
@@ -199,6 +266,47 @@ function collectRuntimeOwnedLoadIdentities(
 }
 
 /**
+ * Keep ordinary review recall bounded to identities the Episode can actually
+ * justify: a runtime-proven load of the active revision, or an exact stable
+ * handle/route mention in frozen evidence. Registry membership alone is not
+ * relevance and must not expose every Current Skill to Author/Verifier.
+ */
+function selectBoundedRelatedCurrentSkills(
+  registry: ReturnType<SkillEvolutionRuntime['getRegistry']>,
+  referencedSkills: readonly ReferencedSkillSnapshot[],
+  explicitEvidence: readonly string[],
+): RelatedCurrentSkill[] {
+  const routedHandles = new Set<string>();
+  for (const snapshot of referencedSkills) {
+    if (!snapshot.capabilityHandle || !snapshot.name || !snapshot.guidanceHash) continue;
+    const record = registry.capabilities[snapshot.capabilityHandle];
+    if (
+      record
+      && record.routingName === snapshot.name
+      && record.guidanceHash === snapshot.guidanceHash
+    ) {
+      routedHandles.add(record.handle);
+    }
+  }
+
+  return Object.values(registry.capabilities)
+    .filter(record =>
+      routedHandles.has(record.handle)
+      || explicitEvidence.some(text =>
+        containsExactStableIdentifier(text, record.handle)
+        || containsExactStableIdentifier(text, record.routingName),
+      ),
+    )
+    .map(record => ({
+      handle: record.handle,
+      revision: record.revision,
+      routingName: record.routingName,
+      description: record.description,
+      guidanceHash: record.guidanceHash,
+    }));
+}
+
+/**
  * Build the fixed Evidence Bundle for one Learning Episode.
  *
  * For external-origin episodes that have a persisted Evidence Capsule, the
@@ -233,17 +341,9 @@ export function buildEpisodeEvidenceBundle(
     ref: settlementEntry.ref,
     sourceFilePath: settlementEntry.sourceFilePath,
     turn: settlementEntry.turn,
+    ...(settlementEntry.byteRange ? { byteRange: settlementEntry.byteRange } : {}),
   }];
   const registry = skillEvolution.getRegistry();
-  const relatedCurrentSkills: readonly RelatedCurrentSkill[] = Object.values(registry.capabilities).map(
-    record => ({
-      handle: record.handle,
-      revision: record.revision,
-      routingName: record.routingName,
-      description: record.description,
-      guidanceHash: record.guidanceHash,
-    }),
-  );
 
   const bundleId = `v3:learning-episode:${episode.episodeId}`;
   const allReferencedSkillSnapshots = skillEvolution.getReferencedSkillSnapshots();
@@ -261,10 +361,19 @@ export function buildEpisodeEvidenceBundle(
   if (capsuleStore) {
     const capsule = capsuleStore.findByBundleId(bundleId);
     if (capsule) {
+      const relatedCurrentSkills = selectBoundedRelatedCurrentSkills(
+        registry,
+        referencedSkills,
+        [
+          ...capsule.semanticObservations.map(observation => observation.value),
+          ...capsule.completionEvidence.map(evidence => evidence.content),
+          ...capsule.settlementEvidence.map(evidence => evidence.content),
+        ],
+      );
       return reconstructBundleFromCapsule(
         capsule,
         referencedSkills,
-        registry,
+        relatedCurrentSkills,
         referencedSkillProvenance,
       );
     }
@@ -275,8 +384,23 @@ export function buildEpisodeEvidenceBundle(
     }
   }
 
+  const sourceEvidence = buildLocalSourceEvidence(
+    episode,
+    completionEvidence,
+    settlementEntry,
+  );
+  const relatedCurrentSkills = selectBoundedRelatedCurrentSkills(
+    registry,
+    referencedSkills,
+    [
+      ...episode.semanticObservations.map(observation => observation.value),
+      ...sourceEvidence.map(evidence => evidence.content),
+    ],
+  );
+
   return {
     bundleId,
+    authority: { kind: 'learning-episode', episodeId: episode.episodeId },
     episode: candidate,
     completionEvidence,
     settlementEvidence,
@@ -285,5 +409,6 @@ export function buildEpisodeEvidenceBundle(
     referencedSkills,
     relatedCurrentSkills,
     referencedSkillProvenance,
+    sourceEvidence,
   };
 }

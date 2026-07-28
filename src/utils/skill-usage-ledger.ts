@@ -48,12 +48,24 @@ export interface RecordGeneratedSkillLoadInput {
   recordedAt?: Date;
 }
 
-export interface RecordSkillUsageOutcomeInput {
+interface RecordSkillUsageOutcomeBase {
   episodeId: string;
-  outcome: SkillUsageOutcome;
+  runtimeSessionId: string;
   evidenceRefs: readonly string[];
   recordedAt?: Date;
 }
+
+export type RecordSkillUsageOutcomeInput = RecordSkillUsageOutcomeBase & (
+  | {
+      outcome: 'contradicted';
+      /** Exact load facts this correction evidence is allowed to qualify. */
+      targetLoadFactIds: readonly string[];
+    }
+  | {
+      outcome: Exclude<SkillUsageOutcome, 'contradicted'>;
+      targetLoadFactIds?: readonly string[];
+    }
+);
 
 /**
  * Append-only facts about generated Current Skill loading and same-episode
@@ -83,19 +95,30 @@ export class SkillUsageLedger {
 
   recordOutcome(input: RecordSkillUsageOutcomeInput): SkillUsageOutcomeFact[] {
     assertNonEmpty(input.episodeId, 'episodeId');
-    const evidenceRefs = uniqueNonEmpty(input.evidenceRefs);
+    assertNonEmpty(input.runtimeSessionId, 'runtimeSessionId');
+    const evidenceRefs = canonicalEvidenceRefs(input.evidenceRefs);
     if (evidenceRefs.length === 0) throw new Error('Skill Usage Ledger outcome requires evidence refs.');
     const facts = this.listFacts();
+    const targetLoadFactIds = new Set(uniqueNonEmpty(input.targetLoadFactIds ?? []));
+    // A contradiction is negative evidence only about a bound Skill load. An
+    // episode-level correction alone does not prove that every loaded Skill
+    // was followed or caused the corrected result; the single-load fallback
+    // below is safe only when the correction contains no loaded identity.
+    if (input.outcome === 'contradicted' && targetLoadFactIds.size === 0) return [];
     const loads = facts.filter((fact): fact is GeneratedSkillLoadFact =>
-      fact.kind === 'generated-skill-load' && fact.episodeId === input.episodeId,
+      fact.kind === 'generated-skill-load'
+      && fact.episodeId === input.episodeId
+      && fact.runtimeSessionId === input.runtimeSessionId
+      && (targetLoadFactIds.size === 0 || targetLoadFactIds.has(fact.factId)),
     );
     const existing = new Set(facts
       .filter((fact): fact is SkillUsageOutcomeFact => fact.kind === 'episode-outcome')
-      .map(fact => `${fact.loadFactId}:${fact.outcome}`));
+      .map(fact => outcomeIdempotencyKey(fact.loadFactId, fact.outcome, fact.evidenceRefs)));
     const recordedAt = (input.recordedAt ?? new Date()).toISOString();
     const outcomes: SkillUsageOutcomeFact[] = [];
     for (const load of loads) {
-      if (existing.has(`${load.factId}:${input.outcome}`)) continue;
+      const idempotencyKey = outcomeIdempotencyKey(load.factId, input.outcome, evidenceRefs);
+      if (existing.has(idempotencyKey)) continue;
       const fact: SkillUsageOutcomeFact = {
         schemaVersion: SKILL_USAGE_LEDGER_SCHEMA_VERSION,
         kind: 'episode-outcome',
@@ -107,6 +130,7 @@ export class SkillUsageLedger {
         evidenceRefs,
       };
       this.append(fact);
+      existing.add(idempotencyKey);
       outcomes.push(fact);
     }
     return outcomes;
@@ -118,23 +142,34 @@ export class SkillUsageLedger {
     // Legacy logs have no canonical AgentTurn correlation. Never join them by
     // timestamp, session proximity, or the distillation-owned episode id.
     if (!episodeId) return [];
-    if (episode.status === 'eligible') {
-      return this.recordOutcome({
+    if (episode.contradictionSignals.length === 0) return [];
+    const loads = this.listFacts().filter((fact): fact is GeneratedSkillLoadFact =>
+      fact.kind === 'generated-skill-load'
+      && fact.episodeId === episodeId
+      && fact.runtimeSessionId === episode.runtimeSessionId,
+    );
+    const loadGroups = groupLoadsByStableSkillIdentity(loads);
+    const singleSkillIdentity = loadGroups.length === 1;
+    const mentionsAnyLoadedSkillIdentity = (message: string): boolean =>
+      loads.some(load => mentionsLoadedSkillIdentity(message, load));
+    const outcomes: SkillUsageOutcomeFact[] = [];
+    for (const group of loadGroups) {
+      const canonicalLoad = group[group.length - 1]!;
+      const evidenceRefs = episode.contradictionSignals
+        .filter(signal => group.some(load => explicitlyTargetsLoadedSkill(signal.message, load))
+          || (singleSkillIdentity && !mentionsAnyLoadedSkillIdentity(signal.message)))
+        .map(signal => signal.source.ref);
+      if (evidenceRefs.length === 0) continue;
+      outcomes.push(...this.recordOutcome({
         episodeId,
-        outcome: 'verified-success',
-        evidenceRefs: episode.completionEvidence.map(item => item.ref),
-        recordedAt,
-      });
-    }
-    if (episode.contradictionSignals.length > 0 || episode.status === 'contradicted') {
-      return this.recordOutcome({
-        episodeId,
+        runtimeSessionId: episode.runtimeSessionId,
         outcome: 'contradicted',
-        evidenceRefs: episode.contradictionSignals.map(item => item.source.ref),
+        evidenceRefs,
+        targetLoadFactIds: [canonicalLoad.factId],
         recordedAt,
-      });
+      }));
     }
-    return [];
+    return outcomes;
   }
 
   listFacts(): SkillUsageLedgerFact[] {
@@ -178,6 +213,71 @@ function assertNonEmpty(value: string, name: string): void {
 
 function uniqueNonEmpty(values: readonly string[]): string[] {
   return [...new Set(values.filter(value => typeof value === 'string' && value.trim()))];
+}
+
+function canonicalEvidenceRefs(values: readonly string[]): string[] {
+  return uniqueNonEmpty(values).sort((left, right) => left.localeCompare(right, 'en'));
+}
+
+function outcomeIdempotencyKey(
+  loadFactId: string,
+  outcome: SkillUsageOutcome,
+  evidenceRefs: readonly string[],
+): string {
+  return JSON.stringify([loadFactId, outcome, canonicalEvidenceRefs(evidenceRefs)]);
+}
+
+/**
+ * Bind correction evidence to a stable Skill identity. A single generated
+ * load may safely inherit an otherwise unqualified correction; multiple loads
+ * still require an explicit identity. Semantic similarity is never used.
+ */
+function explicitlyTargetsLoadedSkill(message: string, load: GeneratedSkillLoadFact): boolean {
+  return loadedSkillIdentifiers(load).some(identifier => containsExactIdentifier(message, identifier));
+}
+
+function mentionsLoadedSkillIdentity(message: string, load: GeneratedSkillLoadFact): boolean {
+  return loadedSkillIdentifiers(load).some(identifier => containsExactIdentifier(message, identifier));
+}
+
+function loadedSkillIdentifiers(load: GeneratedSkillLoadFact): string[] {
+  return uniqueNonEmpty([
+    load.skill.capabilityHandle,
+    load.skill.routingName,
+    load.requestedRoutingName ?? '',
+  ]);
+}
+
+/**
+ * A Capability Handle is the stable identity across guidance revisions and
+ * route migrations; repeated load events are observations, not distinct
+ * Skills.
+ * Collapse them before binding correction evidence so an anonymous correction
+ * remains unambiguous when one stable revision was loaded more than once.
+ * The latest append-only fact is the canonical outcome anchor so Curator
+ * lookup sees the most recent loaded revision; aliases from every event remain
+ * available for exact explicit targeting.
+ */
+function groupLoadsByStableSkillIdentity(
+  loads: readonly GeneratedSkillLoadFact[],
+): GeneratedSkillLoadFact[][] {
+  const groups = new Map<string, GeneratedSkillLoadFact[]>();
+  for (const load of loads) {
+    const key = load.skill.capabilityHandle;
+    const group = groups.get(key);
+    if (group) group.push(load);
+    else groups.set(key, [load]);
+  }
+  return [...groups.values()];
+}
+
+function containsExactIdentifier(message: string, identifier: string): boolean {
+  const normalizedMessage = message.normalize('NFKC').toLowerCase();
+  const normalizedIdentifier = identifier.normalize('NFKC').toLowerCase().trim();
+  if (!normalizedIdentifier) return false;
+  const escaped = normalizedIdentifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|[^\\p{L}\\p{N}_-])${escaped}(?=$|[^\\p{L}\\p{N}_-])`, 'u')
+    .test(normalizedMessage);
 }
 
 /**

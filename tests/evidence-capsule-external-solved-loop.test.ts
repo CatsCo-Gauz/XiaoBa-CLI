@@ -6,7 +6,6 @@ import {
   reconstructBundleFromCapsule,
 } from '../src/utils/evidence-capsule';
 import type { SemanticObservation } from '../src/utils/learning-episode';
-import type { CurrentSkillRegistryState } from '../src/utils/skill-evolution';
 
 /**
  * Progressive Trust regression (root cause #3) for external Evidence Capsule
@@ -29,13 +28,6 @@ const SOURCE_ID = 'xurl-source-codex';
 const EPISODE_ID = 'episode-vscode-exclusion-001';
 const BUNDLE_ID = `v3:learning-episode:${EPISODE_ID}`;
 const REDACTED_AT = new Date('2026-07-15T12:00:00.000Z');
-
-const EMPTY_REGISTRY: CurrentSkillRegistryState = {
-  schemaVersion: 2 as const,
-  catalogRevision: 0,
-  routeRedirects: {},
-  capabilities: {},
-};
 
 function capsuleFrom(completionContent: string, settlementContent: string, observations: SemanticObservation[] = [], completionVerification = '') {
   const completionEntries: {ref: string; content: string; role: 'problem-action' | 'verification'; sourceFilePath: string; turn: number; byteRange: {start: number; end: number}}[] = [
@@ -113,7 +105,7 @@ describe('Evidence Capsule reconstruction preserves external solved-loop (RC #3)
     ],
     'brew bundle check passed; VS Code cask and 19 extensions removed successfully.');
 
-    const bundle = reconstructBundleFromCapsule(capsule, [], EMPTY_REGISTRY);
+    const bundle = reconstructBundleFromCapsule(capsule, [], []);
     const solved = (bundle.episode as { solvedLoop: { problem: string; action: string; verification: string } }).solvedLoop;
 
     assert.ok(solved && typeof solved.problem === 'string', 'reconstructed bundle must carry a solvedLoop');
@@ -129,7 +121,7 @@ describe('Evidence Capsule reconstruction preserves external solved-loop (RC #3)
 
   test('reconstructed provenance byte ranges are non-degenerate (not 0..1) when the capsule carries real ranges', () => {
     const capsule = capsuleFrom('Delivered a bounded external artifact.', 'Settled without contradiction.');
-    const bundle = reconstructBundleFromCapsule(capsule, [], EMPTY_REGISTRY);
+    const bundle = reconstructBundleFromCapsule(capsule, [], []);
     const provenance = (bundle.episode as { provenance: { unitByteRange?: { start: number; end: number } }[] }).provenance;
 
     assert.ok(provenance.length >= 1, 'reconstructed bundle must carry provenance refs');
@@ -144,7 +136,7 @@ describe('Evidence Capsule reconstruction preserves external solved-loop (RC #3)
 
   test('admission-metadata fallback still used when the capsule has no recognizable completion content', () => {
     const capsule = capsuleFrom('', 'Settled without contradiction.');
-    const bundle = reconstructBundleFromCapsule(capsule, [], EMPTY_REGISTRY);
+    const bundle = reconstructBundleFromCapsule(capsule, [], []);
     const solved = (bundle.episode as { solvedLoop: { problem: string; action: string; verification: string } }).solvedLoop;
 
     // When there is no bounded successful completion content, the honest

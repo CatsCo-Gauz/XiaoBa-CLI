@@ -101,12 +101,11 @@ describe('skill-evolution prompt loading', () => {
 });
 
 describe('skill-evolution progressive-trust prompt policy', () => {
-  test('Skill Author prompt requires narrow single-episode guidance and issue-by-issue revision', () => {
+  test('Skill Author prompt lets one bounded episode teach without provenance proxies', () => {
     const text = readRequiredDefaultPromptFile('subagents/skill-author.md');
-    // One settled low-risk episode can justify a narrow skill.
-    assert.match(text, /One settled, low-risk Learning Episode can justify a narrow Current Skill/);
-    // Single-sample uncertainty narrows applicability rather than forcing rejection.
-    assert.match(text, /Single-sample uncertainty narrows the hypothesis/);
+    assert.match(text, /One eligible, low-risk Learning Episode can justify a narrow Current Skill/);
+    assert.match(text, /Lack of explicit user acceptance, a prior Skill load, or independent repetition is not a rejection reason/);
+    assert.match(text, /must not replace guidance, migrate routes, merge Skills, or retire a capability/);
     // Issue-by-issue revision obligation.
     assert.match(text, /address every Verifier issue explicitly in the next round/);
     // Dependencies must be evidenced; relatedCurrentSkills is not a dependency.
@@ -114,19 +113,32 @@ describe('skill-evolution progressive-trust prompt policy', () => {
     assert.match(text, /relatedCurrentSkills is recall context/);
   });
 
-  test('Skill Author prompt allows correction retries to teach the corrected pattern', () => {
+  test('Skill Author prompt binds one correction to the affected Skill', () => {
     const text = readRequiredDefaultPromptFile('subagents/skill-author.md');
-    assert.match(text, /correction retry can teach the corrected pattern/);
-    // Must not promote the contradicted behavior.
-    assert.match(text, /Do not promote the contradicted behavior/);
-    // Must not copy an earlier failed action unless marked as a failure to avoid.
-    assert.match(text, /failure to avoid/);
+    assert.match(text, /For a usage-curation correction bundle, the correction is negative evidence/);
+    assert.match(text, /automatic reassessment may append evidence only/);
+    assert.match(text, /must not retire or replace guidance because the bundle lacks a bounded correction snapshot and the prior guidance body/);
+    assert.match(text, /must not create a Skill, migrate its route, merge Skills, or target any other Skill/);
+    assert.match(text, /Never copy the failed action into guidance or promote the contradicted behavior/);
   });
 
-  test('Skill Verifier prompt forbids rejection based only on one source or one instance', () => {
+  test('Skill Author prompt narrows output, inventory, material-analysis, and high-authority candidates', () => {
+    const text = readRequiredDefaultPromptFile('subagents/skill-author.md');
+    assert.match(text, /Separate a delivered output document from the underlying reusable operation/);
+    assert.match(text, /single authoritative Current Skill Registry/);
+    assert.match(text, /verify discovered Skill directories and active\/enabled state/);
+    assert.match(text, /fix the input requirements, analysis dimensions, fact\/opinion separation rules, and citation boundaries/);
+    assert.match(text, /Do not extend this evidence to arbitrary articles, attachments, meeting notes, transcripts, or domain analysis/);
+    assert.match(text, /Never handle verification codes, plaintext secrets, or unauthorized mailboxes/);
+    assert.match(text, /defer until.*baseline tests.*structured mention protocol.*review, CI, and merge evidence/is);
+  });
+
+  test('Skill Verifier prompt does not reject an ordinary episode for weak proxy signals', () => {
     const text = readRequiredDefaultPromptFile('subagents/skill-verifier.md');
-    assert.match(text, /Sample scarcity by itself is never a rejection reason/);
-    assert.match(text, /Do not reject a candidate only because it has one source, one instance, or no independent repetition/);
+    assert.match(text, /One eligible, low-risk Episode can satisfy this policy/);
+    assert.match(text, /absence of a prior Skill load are never rejection reasons/);
+    assert.match(text, /missing positive feedback/);
+    assert.match(text, /must not replace guidance, migrate routes, merge Skills, or retire a capability/);
   });
 
   test('Skill Verifier prompt routes fixable drafts to revise, missing evidence to defer, and affirmative invalidity to reject', () => {
@@ -144,7 +156,20 @@ describe('skill-evolution progressive-trust prompt policy', () => {
 
   test('Skill Verifier prompt describes correction episode handling', () => {
     const text = readRequiredDefaultPromptFile('subagents/skill-verifier.md');
-    assert.match(text, /Correction episodes/);
-    assert.match(text, /A settled retry can support a narrow Skill that includes the learned boundary or corrected step/);
+    assert.match(text, /Usage-curation correction bundles/);
+    assert.match(text, /automatic correction-bound reassessment may append evidence only/);
+    assert.match(text, /Reject retirement and replacement because the bundle lacks a bounded correction snapshot and the prior guidance body/);
+    assert.match(text, /also reject create, migrate, merge, cross-Skill append/);
+  });
+
+  test('Skill Verifier prompt checks output, inventory, material-analysis, and high-authority candidates', () => {
+    const text = readRequiredDefaultPromptFile('subagents/skill-verifier.md');
+    assert.match(text, /Output\/document vs operation/);
+    assert.match(text, /single authoritative Current Skill Registry/);
+    assert.match(text, /discovered directories and active\/enabled state/);
+    assert.match(text, /fixed input requirements, analysis dimensions, fact\/opinion separation rules, and citation\/source boundaries/);
+    assert.match(text, /generalize one user-provided investor transcript into arbitrary articles, attachments, meeting notes, transcripts, or broad domain analysis/);
+    assert.match(text, /verification codes, plaintext secrets, or unauthorized mailboxes/);
+    assert.match(text, /baseline tests, a structured mention protocol, and final review\/CI\/merge evidence/);
   });
 });

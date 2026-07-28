@@ -44,9 +44,26 @@ import type { DistilledKnowledgeCandidate } from './capability-distiller';
 export const EVIDENCE_REVIEW_JOB_SCHEMA_VERSION = 1 as const;
 
 /** Default prompt / policy version stamps included in Quantum identity. */
-export const EVIDENCE_REVIEW_PROMPT_VERSION = 'evidence-review-job-v2' as const;
+export const EVIDENCE_REVIEW_PROMPT_VERSION = 'evidence-review-job-v6' as const;
 /**
- * Policy v4 (Progressive Trust external-evidence false-negative fix):
+ * Policy v8:
+ *   - Usage correction outcomes require a stable-identity binding to the
+ *     affected Skill load; a single loaded generated Skill may inherit an
+ *     otherwise unqualified correction, while multiple loads require an
+ *     explicit identity and correction proximity is not causation.
+ *   - Usage reassessment cannot replace guidance without the prior guidance
+ *     body in its fixed review basis, and cannot retire a Skill without a
+ *     bounded correction snapshot; automatic usage reassessment only appends
+ *     evidence. Operator retirement remains a separate explicit path.
+ * Policy v6 established:
+ *   - An eligible ordinary Learning Episode may create or append evidence
+ *     without prior Skill use or explicit positive feedback; behavior-changing
+ *     and structural catalog transitions use dedicated evidence paths.
+ *   - Rejection requires affirmative evidence that no safe, transferable
+ *     capability can be written; uncertainty narrows or defers the candidate.
+ * Policy v5 also established:
+ *   - Only explicit contradiction outcomes drive usage reassessment.
+ * Policy v4 also established:
  *   - Structural Difference Index corroboration now keys on classification +
  *     overlapping shard span instead of exact natural-language summary, so
  *     cross-lane paraphrases over the same cited evidence no longer inflate
@@ -60,7 +77,7 @@ export const EVIDENCE_REVIEW_PROMPT_VERSION = 'evidence-review-job-v2' as const;
  *   - Duplicate `create_current_skill` detection against relatedCurrentSkills.
  * Active jobs frozen under v3 must supersede to a successor on the v4 policy.
  */
-export const EVIDENCE_REVIEW_POLICY_VERSION = 'evidence-review-policy-v4' as const;
+export const EVIDENCE_REVIEW_POLICY_VERSION = 'evidence-review-policy-v8' as const;
 
 // ---------------------------------------------------------------------------
 // Shared quantum / job types

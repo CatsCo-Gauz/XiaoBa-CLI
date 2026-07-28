@@ -37,7 +37,7 @@ describe('SessionSkillRuntime', () => {
     assert.match(String(message.content), /本轮所有可用的 skills/);
   });
 
-  test('keeps generated distilled skills visible in the complete transient skills list', () => {
+  test('exposes generated distilled skill metadata in the transient list', () => {
     const runtime = new SessionSkillRuntime(buildSkillManager({
       userInvocableSkills: [
         buildSkill('officecli', 'Office skill'),
@@ -50,6 +50,8 @@ describe('SessionSkillRuntime', () => {
     assert.ok(message);
     assert.match(String(message.content), /officecli: Office skill/);
     assert.match(String(message.content), /distilled-abc123: Distilled memory skill/);
+    assert.doesNotMatch(String(message.content), /Skill prompt for distilled-abc123/);
+    assert.match(runtime.handleSkillsCommand().reply ?? '', /distilled-abc123/);
   });
 
   test('lists skills as names only for slash skills command', () => {

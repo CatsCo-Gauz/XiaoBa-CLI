@@ -59,6 +59,10 @@ function externalCandidate(): DistilledKnowledgeCandidate {
 function externalBundle(): EvidenceBundle {
   return {
     bundleId: 'episode-vscode-exclusion-001',
+    authority: {
+      kind: 'learning-episode',
+      episodeId: 'episode-vscode-exclusion-001',
+    },
     episode: externalCandidate(),
     completionEvidence: [
       { ref: 'xurl://openai/thread-vscode-exclusion#5:problem-action', sourceFilePath: 'xurl://openai/thread-vscode-exclusion', turn: 5, byteRange: { start: 5, end: 6 } },
@@ -67,7 +71,11 @@ function externalBundle(): EvidenceBundle {
       { ref: 'xurl://openai/thread-vscode-exclusion#6:verification', sourceFilePath: 'xurl://openai/thread-vscode-exclusion', turn: 6, byteRange: { start: 5, end: 6 } },
     ],
     semanticObservations: [
-      { kind: 'user-intent', value: 'Exclude VS Code from the Mac developer environment transfer.', sourceRefs: ['xurl://openai/thread-vscode-exclusion#5:problem-action'] },
+      {
+        kind: 'user-intent',
+        value: `Append this exclusion evidence to ${EXISTING_ROUTE}.`,
+        sourceRefs: ['xurl://openai/thread-vscode-exclusion#5:problem-action'],
+      },
     ],
     sourceEvidence: [
       {

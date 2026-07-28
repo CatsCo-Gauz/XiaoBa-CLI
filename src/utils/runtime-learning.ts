@@ -113,6 +113,9 @@ import {
   SkillEvidenceRef,
 } from './skill-evolution';
 import {
+  migratePersistedEvidenceBundleAuthority,
+} from './evidence-bundle-authority';
+import {
   EvidenceCapsuleStore,
   buildEvidenceCapsule,
   redactExternalEvidenceContent,
@@ -129,7 +132,11 @@ import {
   ExternalHistoryProgressUpdate,
   loadExternalSessionLogBackfillState,
 } from './session-log-backfill';
-import { buildEpisodeEvidenceBundle, buildEpisodeSettlementEvidence } from './episode-evidence-bundle';
+import {
+  buildEpisodeEvidenceBundle,
+  buildEpisodeSettlementEvidence,
+  MissingLearningEpisodeSourceEvidenceError,
+} from './episode-evidence-bundle';
 import {
   ExternalEpisodeProvenanceStore,
   type ExternalEpisodeProvenanceState,
@@ -755,7 +762,6 @@ export class RuntimeLearning {
   /** Durable provenance index tying external events to episode ids (issue #78). */
   private readonly externalEpisodeProvenanceStore: ExternalEpisodeProvenanceStore;
 
-  private readonly pendingCuratorObservationEpisodeIds = new Set<string>();
   private readonly activeWakeAbortControllers = new Set<AbortController>();
   /** Public wake results tracked separately so shutdown drain can await durable settlement. */
   private readonly activeWakeResults = new Set<Promise<RuntimeLearningHeartbeatResult>>();
@@ -2502,21 +2508,22 @@ export class RuntimeLearning {
    * expedited curator wake triggering.
    */
   private async flushCuratorObservations(): Promise<void> {
-    if (!this.curator || this.pendingCuratorObservationEpisodeIds.size === 0) return;
+    if (!this.curator) return;
 
     const state = this.episodeStore.load();
-    const pending = new Set(this.pendingCuratorObservationEpisodeIds);
-
     for (const episode of Object.values(state.episodes)) {
-      if (!pending.has(episode.episodeId)) continue;
+      if (!episode.agentTurnEpisodeId || episode.contradictionSignals.length === 0) continue;
       try {
         this.curator.observeEpisode(episode);
-        this.pendingCuratorObservationEpisodeIds.delete(episode.episodeId);
       } catch {
         // Observation failure should not block the wake. The episode
-        // remains queued for a later retry.
+        // remains durable for a later retry.
       }
     }
+
+    // The ledger append and expedited-wake state update are separate writes.
+    // Rebuild the latter even when there were no newly admitted episode ids.
+    this.curator.recoverExpeditedWakes();
   }
 
   // -----------------------------------------------------------------------
@@ -2656,7 +2663,8 @@ export class RuntimeLearning {
     type ReviewTask = EpisodeReviewTask | RetryReviewTask;
 
     const reviewedOrQueuedBundleIds = this.skillEvolution.getReviewedOrQueuedBundleIds();
-    const eligibleEpisodes = Object.values(this.episodeStore.load().episodes)
+    const episodeState = this.episodeStore.load();
+    const eligibleEpisodes = Object.values(episodeState.episodes)
       .filter(episode => (
         episode.status === 'eligible'
         && !this.hasReviewedEpisode(episode, reviewedOrQueuedBundleIds)
@@ -2766,6 +2774,14 @@ export class RuntimeLearning {
         ]!;
         admittedEpisodeTasks.push({ episode: selected.episode, bundle });
       } catch (error) {
+        // Pre-snapshot local Episodes cannot be safely reconstructed. Do not
+        // turn that immutable-data gap into a forever retry continuation;
+        // leave the Episode untouched for explicit migration/inspection.
+        if (error instanceof MissingLearningEpisodeSourceEvidenceError) {
+          pendingEpisodeIds.delete(selected.episode.episodeId);
+          Logger.warning(`[RuntimeLearning] review skipped for legacy Episode ${selected.episode.episodeId}: ${error.message}`);
+          continue;
+        }
         settlementError = settlementError ?? error;
       }
     }
@@ -3857,7 +3873,6 @@ export class RuntimeLearning {
               const ingestUnit = distillationUnits[index]!;
               const ingestionResult = this.evidenceIngestor.ingest(ingestUnit);
 
-              this.queueCuratorObservation(ingestionResult.admittedEpisodeIds);
               batchAdmittedEpisodes += ingestionResult.admittedEpisodeIds.length;
               batchContradictionSignals += ingestionResult.contradictionSignalIds.length;
             }
@@ -4470,14 +4485,11 @@ export class RuntimeLearning {
 
   /**
    * Return runtime-owned GeneratedSkillLoadFact entries tied to the episode's
-   * canonical AgentTurn correlation. Legacy episodes without
-   * `agentTurnEpisodeId` receive no facts — never join by timestamp or
-   * session proximity.
+   * canonical AgentTurn and runtime-session identity. Never join by timestamp
+   * or session proximity.
    */
   private listSkillLoadFactsForEpisode(episode: LearningEpisode): readonly GeneratedSkillLoadFact[] {
-    const episodeId = episode.agentTurnEpisodeId;
-    if (!episodeId) return [];
-    return this.curator?.listLoadFactsForEpisode(episodeId) ?? [];
+    return this.curator?.listLoadFactsForEpisode(episode) ?? [];
   }
 
   // -----------------------------------------------------------------------
@@ -4585,8 +4597,6 @@ export class RuntimeLearning {
           ingestionResult,
         );
 
-        this.queueCuratorObservation(ingestionResult.admittedEpisodeIds);
-
         // Capsule persistence is the first external-evidence boundary after
         // Episode ingestion. Provenance must not become durable without the
         // redacted evidence it points at; replay repairs both before cursor
@@ -4681,24 +4691,35 @@ export class RuntimeLearning {
       if (!episode) continue;
 
       const bundleId = `v3:learning-episode:${episodeId}`;
-      if (this.evidenceCapsuleStore.findByBundleId(bundleId)) continue;
 
-      // Extract evidence content from the episode's completion evidence detail.
+      // Prefer the immutable source snapshot captured at Episode admission.
+      // `detail` remains a legacy fallback only; it is a control-plane summary,
+      // not the user/assistant transcript Author and Verifier should learn from.
+      const frozenSourceByRef = new Map(
+        (episode.sourceEvidence ?? []).map(source => [source.ref, source]),
+      );
       const completionEvidence: {
         ref: string;
         content: string;
         role: 'problem-action' | 'verification';
         sourceFilePath?: string;
         turn?: number;
+        byteRange?: { start: number; end: number };
       }[] = episode.completionEvidence
         .filter(e => e.kind !== 'contradiction')
-        .map(e => ({
-          ref: e.ref,
-          content: e.detail ?? `${e.kind} at turn ${e.turn}`,
-          role: 'problem-action' as const,
-          sourceFilePath: e.sourceFilePath,
-          turn: e.turn,
-        }));
+        .map(e => {
+          const frozen = frozenSourceByRef.get(e.ref);
+          return {
+            ref: e.ref,
+            content: frozen?.content ?? e.detail ?? `${e.kind} at turn ${e.turn}`,
+            role: e.kind === 'artifact-validation' || e.kind === 'user-acceptance'
+              ? 'verification' as const
+              : 'problem-action' as const,
+            sourceFilePath: frozen?.sourceFilePath ?? e.sourceFilePath,
+            turn: frozen?.turn ?? e.turn,
+            ...(frozen?.byteRange ? { byteRange: frozen.byteRange } : {}),
+          };
+        });
 
       // Generate settlement evidence content from episode metadata. The
       // episode is still settling (or historical-pending) at this admission
@@ -4711,12 +4732,14 @@ export class RuntimeLearning {
         role: 'problem-action' | 'verification';
         sourceFilePath?: string;
         turn?: number;
+        byteRange?: { start: number; end: number };
       }[] = [{
         ref: settlementEntry.ref,
         content: settlementEntry.content,
         role: 'verification' as const,
         sourceFilePath: settlementEntry.sourceFilePath,
         turn: settlementEntry.turn,
+        ...(settlementEntry.byteRange ? { byteRange: settlementEntry.byteRange } : {}),
       }];
 
       const capsule = buildEvidenceCapsule({
@@ -4730,6 +4753,10 @@ export class RuntimeLearning {
         now: this.clock(),
       });
       this.evidenceCapsuleStore.upsert(capsule);
+      // Settlement is mutable lifecycle metadata, so synchronize it only
+      // after the immutable upsert succeeds. A completion/semantic conflict
+      // throws above and keeps the external page unacknowledged.
+      this.evidenceCapsuleStore.refreshSettlementEvidence(bundleId, settlementEvidence);
     }
   }
 
@@ -4871,17 +4898,19 @@ export class RuntimeLearning {
     const engine = this.skillEvolution.getEvidenceReviewEngine();
     let recoverableJobs: import('./evidence-review-types').EvidenceReviewJob[];
     try {
-      recoverableJobs = Object.values(engine.loadStore().jobs).filter(
-        job => (job.disposition === 'active' || job.disposition === 'deferred')
-          && job.bundle.bundleId.startsWith('v3:learning-episode:'),
-      );
+      recoverableJobs = Object.values(engine.loadStore().jobs).filter(job => {
+        if (job.disposition !== 'active' && job.disposition !== 'deferred') return false;
+        return migratePersistedEvidenceBundleAuthority(job.bundle)?.authority.kind
+          === 'learning-episode';
+      });
     } catch {
       // Job store optional during early construction / V3-disabled paths.
       return;
     }
     for (const job of recoverableJobs) {
-      const episodeId = job.bundle.bundleId.replace(/^v3:learning-episode:/, '');
-      const episode = episodeById.get(episodeId);
+      const normalized = migratePersistedEvidenceBundleAuthority(job.bundle);
+      if (!normalized || normalized.authority.kind !== 'learning-episode') continue;
+      const episode = episodeById.get(normalized.authority.episodeId);
       if (!episode || !this.isEpisodeFromExternalSource(episode.episodeId)) continue;
       const freshBundle = buildEpisodeEvidenceBundle(
         episode,
@@ -4954,10 +4983,6 @@ export class RuntimeLearning {
     this.evidenceCapsuleStore.addPromotionAuditRef(capsule.capsuleId, auditTransitionId);
   }
 
-  private queueCuratorObservation(episodeIds: readonly string[]): void {
-    for (const id of episodeIds) this.pendingCuratorObservationEpisodeIds.add(id);
-  }
-
   private hasReviewedEpisode(
     episode: LearningEpisode,
     reviewedOrQueuedBundleIds?: ReadonlySet<string>,
@@ -4971,7 +4996,10 @@ export class RuntimeLearning {
   }
 
   private loadReviewFairnessContinuation(): ReviewFairnessContinuation {
-    const fallback: ReviewFairnessContinuation = { nextClass: 'retry', classCursors: {} };
+    const fallback: ReviewFairnessContinuation = {
+      nextClass: 'retry',
+      classCursors: {},
+    };
     try {
       const parsed = JSON.parse(fs.readFileSync(this.reviewContinuationPath, 'utf8')) as {
         schemaVersion?: number;
@@ -4987,6 +5015,9 @@ export class RuntimeLearning {
         const cursor = (rawCursors as Partial<Record<ReviewWorkClass, unknown>>)[workClass];
         if (typeof cursor === 'string' && cursor) classCursors[workClass] = cursor;
       }
+      // Pre-consolidation continuation files may carry `deferredEpisodeIds`.
+      // Ignore that legacy duplicate owner at this explicit read boundary;
+      // retry/defer disposition belongs only to the Evidence Review Job store.
       return { nextClass: parsed.nextClass as ReviewWorkClass, classCursors };
     } catch {
       return fallback;
@@ -5139,7 +5170,10 @@ export class RuntimeLearning {
     try {
       const reviewedOrQueuedBundleIds = this.skillEvolution.getReviewedOrQueuedBundleIds();
       eligibleEpisodes = Object.values(this.episodeStore.load().episodes)
-        .filter(episode => episode.status === 'eligible' && !this.hasReviewedEpisode(episode, reviewedOrQueuedBundleIds))
+        .filter(episode => (
+          episode.status === 'eligible'
+          && !this.hasReviewedEpisode(episode, reviewedOrQueuedBundleIds)
+        ))
         .length;
     } catch { /* fail-closed store status is reported by the wake */ }
     try {

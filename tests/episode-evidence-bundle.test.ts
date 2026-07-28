@@ -3,14 +3,25 @@ import * as assert from 'node:assert/strict';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { buildEpisodeEvidenceBundle, selectRuntimeOwnedReferencedSkills } from '../src/utils/episode-evidence-bundle';
+import {
+  buildEpisodeEvidenceBundle,
+  MissingLearningEpisodeSourceEvidenceError,
+  selectRuntimeOwnedReferencedSkills,
+} from '../src/utils/episode-evidence-bundle';
 import { EvidenceCapsuleStore, buildEvidenceCapsule } from '../src/utils/evidence-capsule';
 import type {
   EvidenceBundle,
   ReferencedSkillSnapshot,
   SkillEvolutionRuntime,
 } from '../src/utils/skill-evolution';
-import type { LearningEpisode } from '../src/utils/learning-episode';
+import {
+  extractLearningEpisodes,
+  LearningEpisodeStore,
+  MAX_LEARNING_EPISODE_SOURCE_EVIDENCE_CONTENT_BYTES,
+  MAX_LEARNING_EPISODE_SOURCE_EVIDENCE_ENTRIES,
+  type LearningEpisode,
+} from '../src/utils/learning-episode';
+import type { DistillationUnit } from '../src/utils/distillation-unit';
 import type { DistilledKnowledgeCandidate } from '../src/utils/capability-distiller';
 import type { GeneratedSkillLoadFact } from '../src/utils/skill-usage-ledger';
 
@@ -45,6 +56,22 @@ function makeEpisode(overrides: Partial<LearningEpisode> = {}): LearningEpisode 
       { ref: 'turn-3#completion', sourceFilePath: '/logs/sessions/chat/test.jsonl', turn: 3, kind: 'artifact-delivery' },
     ],
     contradictionSignals: [],
+    sourceEvidence: [
+      {
+        ref: 'turn-1#completion',
+        role: 'problem-action',
+        content: 'User:\nCreate a sticker.\n\nAssistant:\nI created the sticker.',
+        sourceFilePath: '/logs/sessions/chat/test.jsonl',
+        turn: 1,
+      },
+      {
+        ref: 'turn-3#completion',
+        role: 'problem-action',
+        content: 'User:\nSend the sticker.\n\nAssistant:\nThe sticker was delivered.',
+        sourceFilePath: '/logs/sessions/chat/test.jsonl',
+        turn: 3,
+      },
+    ],
     semanticObservations: [
       { kind: 'user-intent', value: 'create a sticker', sourceRefs: ['turn-1#completion'] },
     ],
@@ -89,6 +116,10 @@ describe('episode-evidence-bundle (extracted responsibility)', () => {
     const bundle = buildEpisodeEvidenceBundle(episode, candidate, skillEvolution);
 
     assert.equal(bundle.bundleId, 'v3:learning-episode:episode-test-001');
+    assert.deepEqual(bundle.authority, {
+      kind: 'learning-episode',
+      episodeId: 'episode-test-001',
+    });
     assert.equal(bundle.episode, candidate);
   });
 
@@ -118,8 +149,68 @@ describe('episode-evidence-bundle (extracted responsibility)', () => {
     assert.match(settlement.ref, /settlement-2026-01-01T00:00:00\.000Z/);
   });
 
-  test('relatedCurrentSkills are derived from the live registry capabilities', () => {
-    const episode = makeEpisode();
+  test('local completion and settlement refs have matching frozen source content', () => {
+    const episode = makeEpisode({ status: 'eligible' });
+    const bundle = buildEpisodeEvidenceBundle(
+      episode,
+      makeCandidate(),
+      makeSkillEvolutionStub({ capabilities: {} }),
+    );
+    const sourceByRef = new Map(bundle.sourceEvidence!.map(source => [source.ref, source]));
+
+    for (const ref of bundle.completionEvidence) {
+      const source = sourceByRef.get(ref.ref);
+      assert.ok(source, `missing completion source for ${ref.ref}`);
+      assert.equal(source.role, 'problem-action');
+      assert.equal(source.sourceFilePath, ref.sourceFilePath);
+      assert.equal(source.turn, ref.turn);
+      assert.ok(source.content.trim());
+    }
+    for (const ref of bundle.settlementEvidence) {
+      const source = sourceByRef.get(ref.ref);
+      assert.ok(source, `missing settlement source for ${ref.ref}`);
+      assert.equal(source.role, 'verification');
+      assert.match(source.content, /status: eligible/);
+    }
+  });
+
+  test('legacy local episode without a frozen source snapshot fails closed', () => {
+    const episode = makeEpisode({ sourceEvidence: undefined });
+    assert.throws(
+      () => buildEpisodeEvidenceBundle(
+        episode,
+        makeCandidate(),
+        makeSkillEvolutionStub({ capabilities: {} }),
+      ),
+      (error: unknown) => (
+        error instanceof MissingLearningEpisodeSourceEvidenceError
+        && /has no frozen source evidence/.test(error.message)
+      ),
+    );
+  });
+
+  test('local episode with a missing completion snapshot fails closed', () => {
+    const episode = makeEpisode({
+      sourceEvidence: makeEpisode().sourceEvidence?.slice(0, 1),
+    });
+    assert.throws(
+      () => buildEpisodeEvidenceBundle(
+        episode,
+        makeCandidate(),
+        makeSkillEvolutionStub({ capabilities: {} }),
+      ),
+      /has no matching frozen source content for turn-3#completion/,
+    );
+  });
+
+  test('relatedCurrentSkills include exact frozen route mentions but exclude the unrelated Registry', () => {
+    const episode = makeEpisode({
+      semanticObservations: [{
+        kind: 'referenced-skill',
+        value: 'Extend `route-a` with this evidence.',
+        sourceRefs: ['turn-1#completion'],
+      }],
+    });
     const skillEvolution = makeSkillEvolutionStub({
       capabilities: {
         'cap-a': {
@@ -134,6 +225,18 @@ describe('episode-evidence-bundle (extracted responsibility)', () => {
           createdAt: '2026-01-01T00:00:00.000Z',
           updatedAt: '2026-01-01T00:00:00.000Z',
         },
+        'cap-b': {
+          handle: 'cap-b',
+          revision: 1,
+          routingName: 'route-b',
+          description: 'Capability B',
+          guidanceHash: 'hash-b',
+          skillFilePath: '/skills/b.md',
+          evidenceRefs: [],
+          referencedSkills: [],
+          createdAt: '2026-01-01T00:00:00.000Z',
+          updatedAt: '2026-01-01T00:00:00.000Z',
+        },
       },
     });
     const bundle: EvidenceBundle = buildEpisodeEvidenceBundle(episode, makeCandidate(), skillEvolution);
@@ -142,6 +245,29 @@ describe('episode-evidence-bundle (extracted responsibility)', () => {
     assert.equal(bundle.relatedCurrentSkills[0].handle, 'cap-a');
     assert.equal(bundle.relatedCurrentSkills[0].routingName, 'route-a');
     assert.equal(bundle.relatedCurrentSkills[0].guidanceHash, 'hash-a');
+  });
+
+  test('relatedCurrentSkills do not inherit unrelated Registry membership', () => {
+    const skillEvolution = makeSkillEvolutionStub({
+      capabilities: {
+        'cap-unrelated': {
+          handle: 'cap-unrelated',
+          revision: 1,
+          routingName: 'unrelated-route',
+          description: 'Unrelated capability',
+          guidanceHash: 'hash-unrelated',
+          skillFilePath: '/skills/unrelated.md',
+          evidenceRefs: [],
+          referencedSkills: [],
+          createdAt: '2026-01-01T00:00:00.000Z',
+          updatedAt: '2026-01-01T00:00:00.000Z',
+        },
+      },
+    });
+
+    const bundle = buildEpisodeEvidenceBundle(makeEpisode(), makeCandidate(), skillEvolution);
+
+    assert.deepEqual(bundle.relatedCurrentSkills, []);
   });
 
   test('referencedSkills exclude the unrelated Skill catalog when no referenced-skill evidence exists', () => {
@@ -192,7 +318,34 @@ describe('episode-evidence-bundle (extracted responsibility)', () => {
       },
     ];
     const skillEvolution = makeSkillEvolutionStub(
-      { capabilities: {} },
+      {
+        capabilities: {
+          'cap-sticker': {
+            handle: 'cap-sticker',
+            revision: 3,
+            routingName: 'create-sticker-svg',
+            description: 'Create sticker SVGs',
+            guidanceHash: 'hash-sticker',
+            skillFilePath: '/skills/generated-distilled/cap-sticker/SKILL.md',
+            evidenceRefs: [],
+            referencedSkills: [],
+            createdAt: '2026-01-01T00:00:00.000Z',
+            updatedAt: '2026-01-01T00:00:00.000Z',
+          },
+          'cap-unrelated': {
+            handle: 'cap-unrelated',
+            revision: 1,
+            routingName: 'catsco-prompt-editor',
+            description: 'Unrelated capability',
+            guidanceHash: 'hash-unrelated',
+            skillFilePath: '/skills/generated-distilled/cap-unrelated/SKILL.md',
+            evidenceRefs: [],
+            referencedSkills: [],
+            createdAt: '2026-01-01T00:00:00.000Z',
+            updatedAt: '2026-01-01T00:00:00.000Z',
+          },
+        },
+      },
       [evidencedSnapshot, unrelatedSnapshot],
     );
     const bundle: EvidenceBundle = buildEpisodeEvidenceBundle(
@@ -209,6 +362,7 @@ describe('episode-evidence-bundle (extracted responsibility)', () => {
     assert.equal(bundle.referencedSkills.length, 1);
     assert.equal(bundle.referencedSkills[0]!.name, 'create-sticker-svg');
     assert.ok(!bundle.referencedSkills.some(skill => skill.name === 'catsco-prompt-editor'));
+    assert.deepEqual(bundle.relatedCurrentSkills.map(skill => skill.handle), ['cap-sticker']);
     assert.deepEqual(bundle.referencedSkillProvenance, {
       kind: 'runtime-owned-generated-skill-load-v1',
       runtimeSessionId: 'sess-1',
@@ -302,6 +456,389 @@ describe('episode-evidence-bundle (extracted responsibility)', () => {
     }
   });
 
+  test('local review basis remains identical after its source log changes and is deleted', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-local-evidence-snapshot-'));
+    try {
+      const sourceFilePath = path.join(root, 'session.jsonl');
+      const episodeStore = new LearningEpisodeStore(path.join(root, 'learning-episodes.json'));
+      const originalTurn = {
+        entry_type: 'turn' as const,
+        turn: 1,
+        timestamp: '2026-01-01T00:00:00.000Z',
+        session_id: 'snapshot-session',
+        session_type: 'cli',
+        episode_id: 'snapshot-agent-turn',
+        user: { text: 'Always use npm for this repository.' },
+        assistant: {
+          text: 'Understood. I will use npm for repository commands.',
+          tool_calls: [],
+        },
+        tokens: { prompt: 20, completion: 12 },
+      };
+      const originalLine = `${JSON.stringify(originalTurn)}\n`;
+      fs.writeFileSync(sourceFilePath, originalLine, 'utf8');
+      const unit: DistillationUnit = {
+        filePath: sourceFilePath,
+        newTurns: [originalTurn],
+        continuityTurns: [],
+        byteRange: { start: 0, end: Buffer.byteLength(originalLine, 'utf8') },
+        generatedAt: '2026-01-01T00:00:01.000Z',
+      };
+      const [extracted] = extractLearningEpisodes(unit, 0).episodes;
+      assert.ok(extracted);
+      const admitted: LearningEpisode = { ...extracted, status: 'eligible' };
+      episodeStore.upsert([admitted]);
+
+      const skillEvolution = makeSkillEvolutionStub({ capabilities: {} });
+      const frozenEpisode = episodeStore.load().episodes[admitted.episodeId]!;
+      const originalBundle = buildEpisodeEvidenceBundle(
+        frozenEpisode,
+        makeCandidate(),
+        skillEvolution,
+      );
+      assert.match(originalBundle.sourceEvidence![0]!.content, /Always use npm/);
+      assert.match(originalBundle.sourceEvidence![0]!.content, /I will use npm/);
+
+      fs.writeFileSync(sourceFilePath, '{"changed":"upstream content"}\n', 'utf8');
+      const afterMutation = buildEpisodeEvidenceBundle(
+        episodeStore.load().episodes[admitted.episodeId]!,
+        makeCandidate(),
+        skillEvolution,
+      );
+      assert.deepEqual(afterMutation, originalBundle);
+      assert.doesNotMatch(JSON.stringify(afterMutation), /upstream content/);
+
+      fs.unlinkSync(sourceFilePath);
+      const afterDeletion = buildEpisodeEvidenceBundle(
+        episodeStore.load().episodes[admitted.episodeId]!,
+        makeCandidate(),
+        skillEvolution,
+      );
+      assert.deepEqual(afterDeletion, originalBundle);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('Episode replay cannot replace evidence already frozen for the same refs', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-local-evidence-replay-'));
+    try {
+      const store = new LearningEpisodeStore(path.join(root, 'learning-episodes.json'));
+      const original = makeEpisode({ status: 'eligible' });
+      store.upsert([original]);
+
+      store.upsert([{
+        ...original,
+        completionEvidence: original.completionEvidence.map(item => ({
+          ...item,
+          detail: `MUTATED DETAIL FOR ${item.ref}`,
+        })),
+        sourceEvidence: original.sourceEvidence!.map(item => ({
+          ...item,
+          content: `MUTATED SOURCE FOR ${item.ref}`,
+        })),
+        semanticObservations: original.semanticObservations.map(item => ({
+          ...item,
+          value: 'mutated semantic observation',
+        })),
+      }]);
+
+      const stored = store.load().episodes[original.episodeId]!;
+      assert.deepEqual(stored.completionEvidence, original.completionEvidence);
+      assert.deepEqual(stored.sourceEvidence, original.sourceEvidence);
+      assert.deepEqual(stored.semanticObservations, original.semanticObservations);
+      assert.doesNotMatch(JSON.stringify(stored), /MUTATED/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('Episode replay overflow preserves the already frozen source snapshot', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-local-evidence-overflow-'));
+    try {
+      const store = new LearningEpisodeStore(path.join(root, 'learning-episodes.json'));
+      const original = makeEpisode({
+        completionEvidence: Array.from(
+          { length: MAX_LEARNING_EPISODE_SOURCE_EVIDENCE_ENTRIES },
+          (_, index) => ({
+            ref: `turn-${index}#completion`,
+            sourceFilePath: '/logs/sessions/chat/test.jsonl',
+            turn: index,
+            kind: 'verified-tool-result' as const,
+          }),
+        ),
+        sourceEvidence: Array.from(
+          { length: MAX_LEARNING_EPISODE_SOURCE_EVIDENCE_ENTRIES },
+          (_, index) => ({
+            ref: `turn-${index}#completion`,
+            role: 'problem-action' as const,
+            content: `Frozen source ${index}`,
+          }),
+        ),
+      });
+      store.upsert([original]);
+
+      store.upsert([{
+        ...original,
+        completionEvidence: [{
+          ref: 'turn-new#completion',
+          sourceFilePath: '/logs/sessions/chat/test.jsonl',
+          turn: 100,
+          kind: 'verified-tool-result',
+        }],
+        sourceEvidence: [{
+          ref: 'turn-new#completion',
+          role: 'problem-action',
+          content: 'Later source that would exceed the entry bound.',
+        }],
+      }]);
+
+      const stored = store.load().episodes[original.episodeId]!;
+      assert.deepEqual(stored.sourceEvidence, original.sourceEvidence);
+      assert.equal(stored.sourceEvidence?.some(item => item.ref === 'turn-new#completion'), false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('local source transcripts are bounded before the Episode is persisted', () => {
+    const longText = '长'.repeat(MAX_LEARNING_EPISODE_SOURCE_EVIDENCE_CONTENT_BYTES * 2);
+    const unit: DistillationUnit = {
+      filePath: '/logs/sessions/chat/bounded.jsonl',
+      newTurns: [{
+        entry_type: 'turn',
+        turn: 1,
+        timestamp: '2026-01-01T00:00:00.000Z',
+        session_id: 'bounded-session',
+        session_type: 'cli',
+        user: { text: `Use npm. ${longText}` },
+        assistant: { text: `Done. ${longText}`, tool_calls: [] },
+        tokens: { prompt: 20, completion: 12 },
+      }],
+      continuityTurns: [],
+      byteRange: { start: 0, end: 20_000 },
+      generatedAt: '2026-01-01T00:00:01.000Z',
+    };
+
+    const [episode] = extractLearningEpisodes(unit, 0).episodes;
+    assert.ok(episode?.sourceEvidence?.length);
+    assert.ok(Buffer.byteLength(episode.sourceEvidence![0]!.content, 'utf8')
+      <= MAX_LEARNING_EPISODE_SOURCE_EVIDENCE_CONTENT_BYTES);
+    assert.match(episode.sourceEvidence![0]!.content, /middle omitted from bounded source evidence/);
+  });
+
+  test('same-name tool calls in one turn retain distinct evidence refs and snapshots', () => {
+    const unit: DistillationUnit = {
+      filePath: '/logs/sessions/chat/repeated-tools.jsonl',
+      newTurns: [{
+        entry_type: 'turn',
+        turn: 1,
+        timestamp: '2026-01-01T00:00:00.000Z',
+        session_id: 'repeated-tools-session',
+        session_type: 'cli',
+        user: { text: 'Send both reports.' },
+        assistant: {
+          text: 'Both reports were sent.',
+          tool_calls: [
+            { id: 'send-1', name: 'send_file', arguments: { path: 'first.md' }, result: 'sent first' },
+            { id: 'send-2', name: 'send_file', arguments: { path: 'second.md' }, result: 'sent second' },
+          ],
+        },
+        tokens: { prompt: 20, completion: 12 },
+      }],
+      continuityTurns: [],
+      byteRange: { start: 0, end: 500 },
+      generatedAt: '2026-01-01T00:00:01.000Z',
+    };
+    const [episode] = extractLearningEpisodes(unit, 0).episodes;
+    assert.ok(episode);
+    assert.equal(episode.completionEvidence.filter(item => item.kind === 'artifact-delivery').length, 2);
+    const refs = episode.completionEvidence
+      .filter(item => item.kind === 'artifact-delivery')
+      .map(item => item.ref);
+    assert.equal(new Set(refs).size, 2);
+    assert.equal(episode.sourceEvidence?.filter(item => refs.includes(item.ref)).length, 2);
+    assert.match(JSON.stringify(episode.sourceEvidence), /first\.md/);
+    assert.match(JSON.stringify(episode.sourceEvidence), /second\.md/);
+  });
+
+  test('an ambiguous folded verification does not erase an earlier frozen snapshot', () => {
+    const unit: DistillationUnit = {
+      filePath: '/logs/sessions/chat/folded-ambiguous.jsonl',
+      newTurns: [
+        {
+          entry_type: 'turn',
+          turn: 1,
+          timestamp: '2026-01-01T00:00:00.000Z',
+          session_id: 'folded-session',
+          session_type: 'cli',
+          user: { text: 'Send the report.' },
+          assistant: {
+            text: 'The report was sent.',
+            tool_calls: [{ name: 'send_file', arguments: { path: 'report.md' }, result: 'sent' }],
+          },
+          tokens: { prompt: 20, completion: 12 },
+        },
+        {
+          entry_type: 'turn',
+          turn: 2,
+          timestamp: '2026-01-01T00:00:01.000Z',
+          session_id: 'folded-session',
+          session_type: 'cli',
+          user: { text: '' },
+          assistant: {
+            text: 'Validated the report.',
+            tool_calls: [{ name: 'validate_artifact', arguments: { path: 'report.md' }, result: 'passed' }],
+          },
+          tokens: { prompt: 20, completion: 12 },
+        },
+        {
+          entry_type: 'turn',
+          turn: 2,
+          timestamp: '2026-01-01T00:00:02.000Z',
+          session_id: 'folded-session',
+          session_type: 'cli',
+          user: { text: '' },
+          assistant: {
+            text: 'Validated the alternate report.',
+            tool_calls: [{ name: 'validate_artifact', arguments: { path: 'alternate.md' }, result: 'passed' }],
+          },
+          tokens: { prompt: 20, completion: 12 },
+        },
+      ],
+      continuityTurns: [],
+      byteRange: { start: 0, end: 1_500 },
+      generatedAt: '2026-01-01T00:00:03.000Z',
+    };
+
+    const [episode] = extractLearningEpisodes(unit, 0).episodes;
+
+    assert.ok(episode);
+    const deliveryRef = episode.completionEvidence.find(item => item.kind === 'artifact-delivery')?.ref;
+    assert.ok(deliveryRef);
+    assert.ok(episode.sourceEvidence?.some(item => item.ref === deliveryRef));
+  });
+
+  test('source snapshots follow the AgentTurn identity when file and turn collide', () => {
+    const unit: DistillationUnit = {
+      filePath: '/logs/sessions/chat/colliding-turns.jsonl',
+      newTurns: [
+        {
+          entry_type: 'turn',
+          turn: 7,
+          timestamp: '2026-01-01T00:00:00.000Z',
+          session_id: 'same-runtime-session',
+          episode_id: 'agent-turn-a',
+          session_type: 'cli',
+          user: { text: 'Always use npm for this task.' },
+          assistant: { text: 'I will use npm for this task.', tool_calls: [] },
+          tokens: { prompt: 20, completion: 12 },
+        },
+        {
+          entry_type: 'turn',
+          turn: 7,
+          timestamp: '2026-01-01T00:00:01.000Z',
+          session_id: 'same-runtime-session',
+          episode_id: 'agent-turn-b',
+          session_type: 'cli',
+          user: { text: 'Always use pnpm for this task.' },
+          assistant: { text: 'I will use pnpm for this task.', tool_calls: [] },
+          tokens: { prompt: 20, completion: 12 },
+        },
+      ],
+      continuityTurns: [],
+      byteRange: { start: 0, end: 1_000 },
+      generatedAt: '2026-01-01T00:00:02.000Z',
+    };
+
+    const episodes = extractLearningEpisodes(unit, 0).episodes;
+    const npmEpisode = episodes.find(item => item.episodeId === 'agent-turn-a');
+    const pnpmEpisode = episodes.find(item => item.episodeId === 'agent-turn-b');
+    assert.ok(npmEpisode?.sourceEvidence?.length);
+    assert.ok(pnpmEpisode?.sourceEvidence?.length);
+    assert.equal(
+      npmEpisode.completionEvidence[0]?.sourceAgentTurnEpisodeId,
+      'agent-turn-a',
+    );
+    assert.equal(
+      pnpmEpisode.completionEvidence[0]?.sourceAgentTurnEpisodeId,
+      'agent-turn-b',
+    );
+    assert.match(JSON.stringify(npmEpisode.sourceEvidence), /\bnpm\b/);
+    assert.doesNotMatch(JSON.stringify(npmEpisode.sourceEvidence), /\bpnpm\b/);
+    assert.match(JSON.stringify(pnpmEpisode.sourceEvidence), /\bpnpm\b/);
+    assert.doesNotMatch(JSON.stringify(pnpmEpisode.sourceEvidence), /\bnpm\b/);
+  });
+
+  test('ambiguous legacy same-turn records fail closed instead of crossing evidence', () => {
+    const unit: DistillationUnit = {
+      filePath: '/logs/sessions/chat/ambiguous-turns.jsonl',
+      newTurns: [
+        {
+          entry_type: 'turn',
+          turn: 8,
+          timestamp: '2026-01-01T00:00:00.000Z',
+          session_id: 'legacy-runtime-session',
+          session_type: 'cli',
+          user: { text: 'Use npm for this task.' },
+          assistant: { text: 'I used npm for this task.', tool_calls: [] },
+          tokens: { prompt: 20, completion: 12 },
+        },
+        {
+          entry_type: 'turn',
+          turn: 8,
+          timestamp: '2026-01-01T00:00:01.000Z',
+          session_id: 'legacy-runtime-session',
+          session_type: 'cli',
+          user: { text: 'Use pnpm for this task.' },
+          assistant: { text: 'I used pnpm for this task.', tool_calls: [] },
+          tokens: { prompt: 20, completion: 12 },
+        },
+      ],
+      continuityTurns: [],
+      byteRange: { start: 0, end: 1_000 },
+      generatedAt: '2026-01-01T00:00:02.000Z',
+    };
+
+    const episodes = extractLearningEpisodes(unit, 0).episodes;
+    assert.equal(episodes.length, 2);
+    assert.ok(episodes.every(item => item.sourceEvidence === undefined));
+  });
+
+  test('local source transcript payloads fail closed when many refs exceed the total bound', () => {
+    const oversizedResult = 'result '.repeat(1_000);
+    const unit: DistillationUnit = {
+      filePath: '/logs/sessions/chat/oversized.jsonl',
+      newTurns: [{
+        entry_type: 'turn',
+        turn: 1,
+        timestamp: '2026-01-01T00:00:00.000Z',
+        session_id: 'oversized-session',
+        session_type: 'cli',
+        user: { text: 'Send these files.' },
+        assistant: {
+          text: 'I sent the files.',
+          tool_calls: Array.from({ length: 40 }, (_, index) => ({
+            id: `call-${index}`,
+            name: `send_file_${index}`,
+            arguments: { index },
+            result: oversizedResult,
+          })),
+        },
+        tokens: { prompt: 20, completion: 12 },
+      }],
+      continuityTurns: [],
+      byteRange: { start: 0, end: 500_000 },
+      generatedAt: '2026-01-01T00:00:01.000Z',
+    };
+
+    const [episode] = extractLearningEpisodes(unit, 0).episodes;
+    assert.ok(episode, 'the Episode itself remains durable');
+    // Every completion ref must have source content or review must fail
+    // closed; silently dropping only the tail refs would be misleading.
+    assert.equal(episode.sourceEvidence, undefined);
+  });
+
   test('external capsule reconstruction excludes unrelated catalog Skills when no referenced-skill evidence is present', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-episode-bundle-capsule-'));
     try {
@@ -368,6 +905,10 @@ describe('episode-evidence-bundle (extracted responsibility)', () => {
       );
 
       assert.equal(bundle.bundleId, bundleId);
+      assert.deepEqual(bundle.authority, {
+        kind: 'learning-episode',
+        episodeId: 'episode-ext-002',
+      });
       assert.deepEqual(bundle.referencedSkills, []);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });

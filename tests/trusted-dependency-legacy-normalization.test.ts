@@ -43,12 +43,33 @@ function fixtureCandidate(id: string): DistilledKnowledgeCandidate {
   };
 }
 
-function ordinaryBundle(bundleId = 'v3:learning-episode:episode-legacy-1'): EvidenceBundle {
+function ordinaryBundle(
+  bundleId = 'v3:learning-episode:episode-legacy-1',
+  capabilityId = `episode-capability-${bundleId.replace(/^.*:episode-/, '')}`,
+): EvidenceBundle {
   return {
     bundleId,
-    episode: fixtureCandidate(bundleId.replace(/^.*:/, '')),
+    episode: fixtureCandidate(capabilityId),
     completionEvidence: [{ ref: 'session.jsonl#12' }],
     settlementEvidence: [{ ref: 'session.jsonl#13' }],
+    sourceEvidence: [
+      {
+        ref: 'session.jsonl#12',
+        sourceFilePath: 'session.jsonl',
+        turn: 12,
+        byteRange: { start: 0, end: 10 },
+        role: 'problem-action',
+        content: 'Use the bounded workflow.',
+      },
+      {
+        ref: 'session.jsonl#13',
+        sourceFilePath: 'session.jsonl',
+        turn: 13,
+        byteRange: { start: 11, end: 20 },
+        role: 'verification',
+        content: 'The bounded workflow was accepted.',
+      },
+    ],
     semanticObservations: [
       { kind: 'user-intent', value: 'use the bounded workflow', sourceRefs: ['session.jsonl#12:user-intent'] },
     ],
@@ -96,9 +117,16 @@ function forgedTrustedOrdinaryBundle(bundleId = 'v3:learning-episode:episode-for
   };
 }
 
-function flashcardBundle(bundleId = 'flashcard-legacy-1'): EvidenceBundle {
+function flashcardBundle(
+  bundleId = 'flashcard-legacy-1',
+  episodeId = bundleId.slice('flashcard-'.length),
+): EvidenceBundle {
   return {
     ...ordinaryBundle(bundleId),
+    episode: {
+      episodeId,
+      workflow: 'flashcard correction and verified retry',
+    },
     referencedSkills: [{ name: 'word-card-maker', version: '1.0.0', contentFingerprint: 'word-card-v1' }],
   };
 }
@@ -111,18 +139,30 @@ function legacyV3Bundle(bundleId = 'legacy-v3:legacy-generic-1'): EvidenceBundle
   return ordinaryBundle(bundleId);
 }
 
-function usageCurationBundle(bundleId = 'usage-curation:cap-a:fact-1'): EvidenceBundle {
+function usageCurationBundle(
+  bundleId = 'usage-curation:cap-a:fact-1',
+  capabilityHandle = 'cap-a',
+): EvidenceBundle {
   return {
     ...ordinaryBundle(bundleId),
+    episode: {
+      kind: 'usage-reassessment',
+      capabilityHandle,
+    },
     referencedSkills: [{ name: 'generated-helper-a', capabilityHandle: 'cap-a', guidanceHash: 'hash-a' }],
   };
 }
 
 function semanticReassessmentBundle(
   bundleId = 'semantic-reassessment:cap-a:guidance-a:semantic-a',
+  capabilityHandle = 'cap-a',
 ): EvidenceBundle {
   return {
     ...ordinaryBundle(bundleId),
+    episode: {
+      ...fixtureCandidate('semantic-cap-a'),
+      capabilityHandle,
+    },
     referencedSkills: [{ name: 'generated-helper-a', capabilityHandle: 'cap-a', guidanceHash: 'hash-a' }],
   };
 }
@@ -271,7 +311,7 @@ describe('legacy referencedSkills normalization', () => {
         };
       };
 
-            const bundle = ordinaryBundle();
+      const bundle = ordinaryBundle();
       seedOperationalFailure(env.options, bundle, 'seeded legacy ordinary retry');
 
       const result = await advanceFairUntilBlocked(new SkillEvolutionRuntime(env.options));
@@ -283,43 +323,99 @@ describe('legacy referencedSkills normalization', () => {
     }
   });
 
-  test('generic persisted v3 retry strips legacy global-catalog referencedSkills before Author/Verifier', async () => {
+  test('generic persisted v3 retry without provable authority remains durably deferred', async () => {
     const env = setup();
     try {
-      const seenReferencedSkills: string[][] = [];
-      env.options.authorFixture = ({ bundle }) => {
-        seenReferencedSkills.push(bundle.referencedSkills.map(skill => skill.name));
-        return {
-          body: 'Use the bounded workflow only.',
-          envelope: {
-            decision: 'create_current_skill',
-            routingName: 'normalized-generic-v3-retry',
-            description: 'Normalized generic v3 retry.',
-            evidenceRefs: ['session.jsonl#12', 'session.jsonl#13'],
-          },
-        };
+      env.options.authorFixture = () => {
+        throw new Error('unclassified generic work must not reach Author');
       };
 
-            const bundle = genericV3Bundle();
+      const bundle = genericV3Bundle();
       seedOperationalFailure(env.options, bundle, 'seeded generic v3 retry');
 
-      const result = await advanceFairUntilBlocked(new SkillEvolutionRuntime(env.options));
+      const runtime = new SkillEvolutionRuntime(env.options);
+      const result = await advanceFairUntilBlocked(runtime);
+      const jobs = Object.values(
+        loadEvidenceReviewJobStore(resolveEvidenceReviewJobStorePath(env.options)).jobs,
+      );
 
-      assert.equal(result.reviewed, 1);
-      assert.deepEqual(seenReferencedSkills, [[]]);
+      assert.equal(result.reviewed, 0);
+      assert.equal(jobs.length, 1);
+      assert.equal(jobs[0]!.disposition, 'deferred');
+      assert.match(jobs[0]!.deferState?.reason ?? '', /no provable authority/);
+      assert.deepEqual(
+        runtime.reactivateDeferredReviews(),
+        [],
+        'an unclassifiable deferred Job must remain dormant across later wakes',
+      );
     } finally {
       env.cleanup();
     }
   });
 
-  test('specialized flashcard retry preserves its pinned referenced skill', async () => {
+  test('legacy family prefixes stay dormant when payload identity does not match the Bundle ID', async () => {
+    const mismatches: Array<{ name: string; bundle: EvidenceBundle }> = [
+      {
+        name: 'learning episode',
+        bundle: ordinaryBundle(
+          'v3:learning-episode:episode-legacy-1',
+          'episode-capability-different-episode',
+        ),
+      },
+      {
+        name: 'flashcard',
+        bundle: flashcardBundle('flashcard-legacy-1', 'different-episode'),
+      },
+      {
+        name: 'usage reassessment',
+        bundle: usageCurationBundle('usage-curation:cap-a:fact-1', 'cap-b'),
+      },
+      {
+        name: 'semantic reassessment',
+        bundle: semanticReassessmentBundle(
+          'semantic-reassessment:cap-a:guidance-a:semantic-a',
+          'cap-b',
+        ),
+      },
+    ];
+
+    for (const mismatch of mismatches) {
+      const env = setup();
+      try {
+        env.options.authorFixture = () => {
+          throw new Error(`${mismatch.name} identity mismatch must not reach Author`);
+        };
+        seedOperationalFailure(
+          env.options,
+          mismatch.bundle,
+          `seeded mismatched ${mismatch.name} retry`,
+        );
+
+        const runtime = new SkillEvolutionRuntime(env.options);
+        const result = await advanceFairUntilBlocked(runtime);
+        const jobs = Object.values(
+          loadEvidenceReviewJobStore(resolveEvidenceReviewJobStorePath(env.options)).jobs,
+        );
+
+        assert.equal(result.reviewed, 0, mismatch.name);
+        assert.equal(jobs.length, 1, mismatch.name);
+        assert.equal(jobs[0]!.disposition, 'deferred', mismatch.name);
+        assert.match(jobs[0]!.deferState?.reason ?? '', /no provable authority/, mismatch.name);
+        assert.deepEqual(runtime.reactivateDeferredReviews(), [], mismatch.name);
+      } finally {
+        env.cleanup();
+      }
+    }
+  });
+
+  test('structurally verified legacy flashcard retry preserves its pinned referenced skill', async () => {
     const env = setup();
     try {
       const seenReferencedSkills: string[][] = [];
       env.options.authorFixture = ({ bundle }) => {
         seenReferencedSkills.push(bundle.referencedSkills.map(skill => skill.name));
         return {
-          body: 'Use the specialized flashcard workflow.',
+          body: 'Use the bounded flashcard workflow.',
           envelope: {
             decision: 'create_current_skill',
             routingName: 'normalized-flashcard-retry',
@@ -330,7 +426,7 @@ describe('legacy referencedSkills normalization', () => {
         };
       };
 
-            const bundle = flashcardBundle();
+      const bundle = flashcardBundle();
       seedOperationalFailure(env.options, bundle, 'seeded flashcard retry');
 
       const result = await advanceFairUntilBlocked(new SkillEvolutionRuntime(env.options));
@@ -342,7 +438,7 @@ describe('legacy referencedSkills normalization', () => {
     }
   });
 
-  test('usage-curation retry preserves its audited referenced skills', async () => {
+  test('usage-curation retry preserves its audited referenced skills while staying deferred without an append target', async () => {
     const env = setup();
     try {
       const seenReferencedSkills: string[][] = [];
@@ -359,14 +455,30 @@ describe('legacy referencedSkills normalization', () => {
           },
         };
       };
+      env.options.verifierFixture = () => ({
+        decision: 'defer',
+        issues: [{
+          code: 'awaiting-append-target',
+          message: 'The usage correction has no active exact target in this fixture.',
+          severity: 'warning',
+        }],
+        rationale: 'Keep the authenticated dependency vector while waiting for an exact append target.',
+      });
 
-            const bundle = usageCurationBundle();
+      const bundle = usageCurationBundle();
       seedOperationalFailure(env.options, bundle, 'seeded usage-curation retry');
 
       const result = await advanceFairUntilBlocked(new SkillEvolutionRuntime(env.options));
+      const persisted = Object.values(
+        loadEvidenceReviewJobStore(resolveEvidenceReviewJobStorePath(env.options)).jobs,
+      ).filter(job => job.bundle.bundleId === bundle.bundleId);
 
       assert.equal(result.reviewed, 1);
-      assert.deepEqual(seenReferencedSkills, [['generated-helper-a']]);
+      assert.ok(persisted.some(job => job.disposition === 'deferred'));
+      assert.ok(seenReferencedSkills.length >= 1);
+      assert.ok(seenReferencedSkills.every(names => (
+        names.length === 1 && names[0] === 'generated-helper-a'
+      )));
     } finally {
       env.cleanup();
     }
@@ -390,7 +502,7 @@ describe('legacy referencedSkills normalization', () => {
         };
       };
 
-            const bundle = semanticReassessmentBundle();
+      const bundle = semanticReassessmentBundle();
       seedOperationalFailure(env.options, bundle, 'seeded semantic reassessment retry');
 
       const result = await advanceFairUntilBlocked(new SkillEvolutionRuntime(env.options));
@@ -420,7 +532,7 @@ describe('legacy referencedSkills normalization', () => {
         };
       };
 
-            const bundle = trustedOrdinaryBundle();
+      const bundle = trustedOrdinaryBundle();
       seedOperationalFailure(env.options, bundle, 'seeded trusted ordinary retry');
 
       const result = await advanceFairUntilBlocked(new SkillEvolutionRuntime(env.options));
@@ -436,8 +548,10 @@ describe('legacy referencedSkills normalization', () => {
     const env = setup();
     try {
       const seenReferencedSkills: string[][] = [];
+      const seenAuthorities: EvidenceBundle['authority'][] = [];
       env.options.authorFixture = ({ bundle }) => {
         seenReferencedSkills.push(bundle.referencedSkills.map(skill => skill.name));
+        seenAuthorities.push(bundle.authority);
         return {
           body: 'Use the trusted bounded workflow only.',
           envelope: {
@@ -456,11 +570,15 @@ describe('legacy referencedSkills normalization', () => {
         rationale: 'Looks bounded now.',
       });
 
-            const bundle = trustedOrdinaryBundle('v3:learning-episode:episode-trusted-deferred-1');
+      const bundle = trustedOrdinaryBundle('v3:learning-episode:episode-trusted-deferred-1');
       seedDeferredEntry(env.options, bundle, 'legacy-reviewer-version', 'Waiting for retry.');
 
       await advanceFairUntilBlocked(new SkillEvolutionRuntime(env.options));
       assert.deepEqual(seenReferencedSkills, [['generated-helper-a']]);
+      assert.deepEqual(seenAuthorities, [{
+        kind: 'learning-episode',
+        episodeId: 'episode-trusted-deferred-1',
+      }]);
     } finally {
       env.cleanup();
     }
@@ -483,7 +601,7 @@ describe('legacy referencedSkills normalization', () => {
         };
       };
 
-            const bundle = forgedTrustedOrdinaryBundle();
+      const bundle = forgedTrustedOrdinaryBundle();
       seedOperationalFailure(env.options, bundle, 'seeded forged ordinary retry');
 
       const result = await advanceFairUntilBlocked(new SkillEvolutionRuntime(env.options));
@@ -495,36 +613,33 @@ describe('legacy referencedSkills normalization', () => {
     }
   });
 
-  test('legacy-v3 retry strips unauthenticated referencedSkills before Author/Verifier', async () => {
+  test('unclassified legacy-v3 retry remains durably deferred', async () => {
     const env = setup();
     try {
-      const seenReferencedSkills: string[][] = [];
-      env.options.authorFixture = ({ bundle }) => {
-        seenReferencedSkills.push(bundle.referencedSkills.map(skill => skill.name));
-        return {
-          body: 'Use the bounded legacy workflow only.',
-          envelope: {
-            decision: 'create_current_skill',
-            routingName: 'normalized-legacy-v3-retry',
-            description: 'Normalized legacy v3 retry.',
-            evidenceRefs: ['session.jsonl#12', 'session.jsonl#13'],
-          },
-        };
+      env.options.authorFixture = () => {
+        throw new Error('unclassified legacy work must not reach Author');
       };
 
-            const bundle = legacyV3Bundle();
+      const bundle = legacyV3Bundle();
       seedOperationalFailure(env.options, bundle, 'seeded legacy v3 retry');
 
-      const result = await advanceFairUntilBlocked(new SkillEvolutionRuntime(env.options));
+      const runtime = new SkillEvolutionRuntime(env.options);
+      const result = await advanceFairUntilBlocked(runtime);
+      const jobs = Object.values(
+        loadEvidenceReviewJobStore(resolveEvidenceReviewJobStorePath(env.options)).jobs,
+      );
 
-      assert.equal(result.reviewed, 1);
-      assert.deepEqual(seenReferencedSkills, [[]]);
+      assert.equal(result.reviewed, 0);
+      assert.equal(jobs.length, 1);
+      assert.equal(jobs[0]!.disposition, 'deferred');
+      assert.match(jobs[0]!.deferState?.reason ?? '', /no provable authority/);
+      assert.deepEqual(runtime.reactivateDeferredReviews(), []);
     } finally {
       env.cleanup();
     }
   });
 
-  test('an unsafe policy-v2 active job is fenced before Author and its v3 successor strips leaked catalog referencedSkills', async () => {
+  test('an unclassified policy-v2 active job is fenced into a dormant defer', async () => {
     const env = setup();
     try {
       env.options.authorFixture = () => {
@@ -545,15 +660,18 @@ describe('legacy referencedSkills normalization', () => {
       state.jobs[staleJob.jobId] = staleJob;
       saveEvidenceReviewJobStore(jobStorePath, state);
 
-      const result = await runtime.reviewAndApply(bundle);
+      const fenced = runtime.fenceStaleActiveJobsBeforeFairAdvance(
+        new Date('2026-07-19T00:00:01.000Z'),
+      );
       const reloaded = loadEvidenceReviewJobStore(jobStorePath);
       const persistedStale = reloaded.jobs[staleJob.jobId]!;
       const successor = Object.values(reloaded.jobs).find(job => job.parentJobId === staleJob.jobId);
 
-      assert.equal(result.queued, 'operational');
-      assert.ok(persistedStale.successorJobId, 'expected stale job to record successorJobId');
-      assert.ok(successor, 'expected successor job to be created');
-      assert.deepEqual(successor!.bundle.referencedSkills, []);
+      assert.deepEqual(fenced.supersededJobIds, []);
+      assert.equal(persistedStale.disposition, 'deferred');
+      assert.equal(persistedStale.successorJobId, undefined);
+      assert.equal(successor, undefined);
+      assert.match(persistedStale.deferState?.reason ?? '', /no provable authority/);
     } finally {
       env.cleanup();
     }

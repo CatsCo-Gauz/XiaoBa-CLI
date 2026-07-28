@@ -1,7 +1,7 @@
 import { Skill } from '../types/skill';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { PathResolver } from '../utils/path-resolver';
+import { defaultDistilledOutputDir, PathResolver } from '../utils/path-resolver';
 import { SkillParser } from './skill-parser';
 import { Logger } from '../utils/logger';
 import {
@@ -168,7 +168,10 @@ export class SkillManager {
     const registryPath = PathResolver.getSkillEvolutionRegistryPath();
     const loaded = loadCurrentSkillRegistry(registryPath);
     // Fail closed / restore from authoritative history only. Never invent guidance.
-    const reconciled = reconcileActiveGeneratedSkillArtifacts(loaded);
+    const reconciled = reconcileActiveGeneratedSkillArtifacts(
+      loaded,
+      defaultDistilledOutputDir(PathResolver.getSkillsPath()),
+    );
     if (reconciled.repaired) {
       try {
         // Persist restored paths only after successful artifact recovery.
@@ -258,16 +261,15 @@ export class SkillManager {
   }
 
   /**
-   * Generated output is registry-owned. Once a non-empty Registry exists,
-   * only the active file referenced by a capability is discoverable; stale
-   * retired/orphaned files must not become a second public Skill route.
+   * Generated output is registry-owned. Only an active file referenced by a
+   * capability is discoverable; an empty Registry admits no generated files.
    * Manual skills remain filesystem-discovered and are never filtered here.
    */
   private shouldDiscoverSkill(filePath: string): boolean {
     if (!isGeneratedSkillPath(filePath)) return true;
     if (this.registryLoadFailed) return false;
     const records = Object.values(this.registry?.capabilities ?? {});
-    if (records.length === 0) return true;
+    if (records.length === 0) return false;
     const resolvedPath = path.resolve(filePath);
     return records.some(record => path.resolve(record.skillFilePath) === resolvedPath);
   }

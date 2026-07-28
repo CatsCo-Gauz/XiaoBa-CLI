@@ -31,7 +31,6 @@ import {
   SkillEvidenceRef,
   ReferencedSkillSnapshot,
   RelatedCurrentSkill,
-  CurrentSkillRegistryState,
   RuntimeOwnedReferencedSkillProvenance,
 } from './skill-evolution';
 import { DistilledKnowledgeCandidate } from './capability-distiller';
@@ -180,6 +179,14 @@ export class EvidenceCapsuleStore {
   upsert(capsule: EvidenceCapsule): void {
     assertEvidenceCapsuleWithinBounds(capsule);
     const state = this.load();
+    const existing = state.capsules[capsule.capsuleId]
+      ?? Object.values(state.capsules).find(item => item.bundleId === capsule.bundleId);
+    if (existing) {
+      if (capsuleImmutableFingerprint(existing) !== capsuleImmutableFingerprint(capsule)) {
+        throw new Error(`evidence capsule immutable integrity conflict for bundle ${capsule.bundleId}`);
+      }
+      return;
+    }
     state.capsules[capsule.capsuleId] = {
       ...capsule,
       promotionAuditRefs: [...capsule.promotionAuditRefs],
@@ -230,6 +237,7 @@ export class EvidenceCapsuleStore {
       content: string;
       sourceFilePath?: string;
       turn?: number;
+      byteRange?: { start: number; end: number };
     }[],
   ): boolean {
     const state = this.load();
@@ -286,6 +294,17 @@ export class EvidenceCapsuleStore {
   count(): number {
     return Object.keys(this.load().capsules).length;
   }
+}
+
+function capsuleImmutableFingerprint(capsule: EvidenceCapsule): string {
+  return hash(JSON.stringify({
+    provenance: capsule.provenance,
+    identity: capsule.identity,
+    episodeId: capsule.episodeId,
+    bundleId: capsule.bundleId,
+    completionEvidence: capsule.completionEvidence,
+    semanticObservations: capsule.semanticObservations,
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -728,8 +747,8 @@ export function buildEvidenceCapsule(options: BuildEvidenceCapsuleOptions): Evid
  *     to a sourceEvidence entry with the correct role).
  *   - Carries the same bundleId and episode identity so that the existing
  *     review deduplication (hasReviewedEpisode, queue state) works.
- *   - Includes current registry context so Author/Verifier can evaluate
- *     against the live capability set.
+ *   - Carries only the caller-selected bounded Current Skill context; capsule
+ *     reconstruction never expands that set from the global Registry.
  *   - Reconstructs a fallback DistilledKnowledgeCandidate when the capsule
  *     does not carry a full candidate object — this satisfies the
  *     EvidenceBundle.episode contract without requiring the original
@@ -742,7 +761,7 @@ export function buildEvidenceCapsule(options: BuildEvidenceCapsuleOptions): Evid
 export function reconstructBundleFromCapsule(
   capsule: EvidenceCapsule,
   referencedSkills: readonly ReferencedSkillSnapshot[],
-  registry: CurrentSkillRegistryState,
+  relatedCurrentSkills: readonly RelatedCurrentSkill[],
   referencedSkillProvenance?: RuntimeOwnedReferencedSkillProvenance,
 ): EvidenceBundle {
   // Reconstruct evidence refs from capsule evidence entries
@@ -835,19 +854,9 @@ export function reconstructBundleFromCapsule(
     },
   };
 
-  // Current registry context for Author/Verifier evaluation
-  const relatedCurrentSkills: readonly RelatedCurrentSkill[] = Object.values(registry.capabilities).map(
-    record => ({
-      handle: record.handle,
-      revision: record.revision,
-      routingName: record.routingName,
-      description: record.description,
-      guidanceHash: record.guidanceHash,
-    }),
-  );
-
   return {
     bundleId: capsule.bundleId,
+    authority: { kind: 'learning-episode', episodeId: capsule.episodeId },
     episode: candidate,
     completionEvidence,
     settlementEvidence,

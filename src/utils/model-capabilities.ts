@@ -40,7 +40,7 @@ export function isPrimaryModelVisionCapable(config: Pick<ChatConfig, 'apiUrl' | 
   const isRelay = apiUrl.includes('relay.catsco.cc');
   if (isRelay) {
     const relayProfile = findRelayModelProfile(model);
-    if (relayProfile) {
+    if (relayProfile?.capabilities.vision !== undefined) {
       return relayProfile.capabilities.vision;
     }
   }

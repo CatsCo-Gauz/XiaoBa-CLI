@@ -53,6 +53,15 @@ import {
   EVIDENCE_REVIEW_POLICY_VERSION,
   EVIDENCE_REVIEW_PROMPT_VERSION,
 } from './evidence-review-types';
+import {
+  classifyEvidenceBundleAuthority,
+  containsExactStableIdentifier,
+  migratePersistedEvidenceBundleAuthority,
+  requireExplicitEvidenceBundleAuthority,
+  semanticPriorGuidanceEvidenceRef,
+  type EvidenceBundleAuthority,
+} from './evidence-bundle-authority';
+import { validateFrozenSourceEvidence } from './frozen-source-evidence';
 
 /**
  * V3's runtime-owned promotion seam.
@@ -128,6 +137,12 @@ export interface RuntimeOwnedReferencedSkillProvenance {
 /** The one fixed input shared by Author and Verifier branches. */
 export interface EvidenceBundle {
   bundleId: string;
+  /**
+   * Explicit mutation authority for newly-created bundles. Optional only so
+   * persisted pre-authority bundles can be classified through one fail-closed
+   * legacy compatibility path.
+   */
+  authority?: EvidenceBundleAuthority;
   episode: unknown;
   completionEvidence: readonly SkillEvidenceRef[];
   settlementEvidence: readonly SkillEvidenceRef[];
@@ -530,12 +545,23 @@ export interface SkillEvolutionQueueReviewResult {
 export interface TransitionJournal {
   schemaVersion: typeof SKILL_EVOLUTION_SCHEMA_VERSION;
   transitionId: string;
+  /**
+   * Hash of the Registry state read before this transition was planned.
+   * Absent on legacy journals; those retain their historical best-effort
+   * recovery behavior.
+   */
+  priorRegistryHash?: string;
   targetRegistryHash: string;
   targetRegistry: CurrentSkillRegistryState;
   skillOperations: Array<{
     path: string;
     content?: string;
     expectedHash?: string;
+    /**
+     * Hash of the file before this operation. `null` means the operation
+     * expected the path to be absent. Absent on legacy operations.
+     */
+    priorHash?: string | null;
     delete?: boolean;
     immutable?: boolean;
   }>;
@@ -645,11 +671,17 @@ export class SkillEvolutionRuntime {
         .map(entry => entry.bundleId)
         .filter((bundleId): bundleId is string => typeof bundleId === 'string'),
     );
-    // Evidence Review Jobs own their bundle until a terminal disposition.
+    // The durable Job remains the authoritative review fact after a terminal
+    // semantic rejection as well. A completed job without a transition audit
+    // must still prevent the same Episode from being re-admitted forever.
     try {
       const jobs = this.getEvidenceReviewEngine().loadStore().jobs;
       for (const job of Object.values(jobs)) {
-        if (job.disposition === 'active' || job.disposition === 'deferred') {
+        if (
+          job.disposition === 'active'
+          || job.disposition === 'deferred'
+          || job.disposition === 'completed'
+        ) {
           bundleIds.add(job.bundle.bundleId);
         }
       }
@@ -1422,14 +1454,14 @@ export class SkillEvolutionRuntime {
    * generic Distillation Unit bundles (`v3:<file>:<range>:<candidate>`), and
    * legacy bootstrap bundles (`legacy-v3:`).
    *
-   * Preserve dependencies only for explicit, audited specialized families whose
-   * builders already authenticate or intentionally pin their dependency vector:
+   * Preserve dependencies only for explicit, audited families whose builders
+   * already authenticate or intentionally pin their dependency vector:
    * flashcard composition (`flashcard-`), usage curation (`usage-curation:`),
    * and semantic reassessment (`semantic-reassessment:`).
    */
   private normalizePersistedBundleForReReview(bundle: EvidenceBundle): EvidenceBundle {
     if (bundle.referencedSkills.length === 0) return bundle;
-    if (this.preservePersistedReferencedSkills(bundle.bundleId)) return bundle;
+    if (this.preservePersistedReferencedSkills(bundle)) return bundle;
     const trustedReferencedSkills = selectTrustedPersistedReferencedSkills(bundle);
     if (trustedReferencedSkills.length === 0) {
       return freezeClone({ ...bundle, referencedSkills: [] });
@@ -1438,10 +1470,11 @@ export class SkillEvolutionRuntime {
     return freezeClone({ ...bundle, referencedSkills: trustedReferencedSkills });
   }
 
-  private preservePersistedReferencedSkills(bundleId: string): boolean {
-    return bundleId.startsWith('flashcard-')
-      || bundleId.startsWith('usage-curation:')
-      || bundleId.startsWith('semantic-reassessment:');
+  private preservePersistedReferencedSkills(bundle: EvidenceBundle): boolean {
+    const authority = migratePersistedEvidenceBundleAuthority(bundle)?.authority;
+    return authority?.kind === 'flashcard'
+      || authority?.kind === 'usage-reassessment'
+      || authority?.kind === 'semantic-reassessment';
   }
 
   private supersedeStaleReviewJob(
@@ -1456,8 +1489,8 @@ export class SkillEvolutionRuntime {
     // stale job's frozen read set alone. A persisted legacy/global-catalog
     // `referencedSkills` array must never be carried into the successor: apply
     // the Progressive Trust normalization so ordinary legacy referencedSkills
-    // are stripped (fail closed) while specialized bundles keep their pinned
-    // dependencies.
+    // are stripped (fail closed) while structurally authenticated bundle
+    // families keep their pinned dependencies.
     const normalizedLiveBundle = this.normalizePersistedBundleForReReview(liveBundle);
     const resolvedLiveReadSet = liveRegistryReadSet
       ?? resolveLiveDeclaredRegistryReadSet(
@@ -1536,6 +1569,63 @@ export class SkillEvolutionRuntime {
     for (const jobId of activeJobIds) {
       const current = engine.loadStore().jobs[jobId];
       if (!current || !isDueRunnableActiveJob(current)) continue;
+      const bundleAuthority = classifyEvidenceBundleAuthority(current.bundle);
+      const migratedLegacyBundle = bundleAuthority.legacy
+        ? migratePersistedEvidenceBundleAuthority(
+          this.normalizePersistedBundleForReReview(current.bundle),
+        )
+        : undefined;
+      const effectiveAuthority = migratedLegacyBundle?.authority ?? bundleAuthority.authority;
+
+      // A pre-source-snapshot Learning Episode may already have an active
+      // durable job from an older runtime. It cannot be rebuilt from the
+      // current log without changing the review basis, so quarantine it as a
+      // normal dormant defer before any reader/author quantum can run. The
+      // Episode remains available for explicit migration or inspection.
+      const missingLearningSource = effectiveAuthority?.kind === 'learning-episode'
+        && !hasCompleteFrozenSourceEvidence(current.bundle);
+      if (
+        missingLearningSource
+        || bundleAuthority.malformedAuthority
+        || (bundleAuthority.legacy && !migratedLegacyBundle)
+      ) {
+        const state = engine.loadStore();
+        const live = state.jobs[jobId];
+        if (live && live.disposition === 'active') {
+          const reason = missingLearningSource
+            ? 'Learning Episode review basis has no complete frozen source evidence; explicit migration is required.'
+            : bundleAuthority.malformedAuthority
+              ? 'Evidence Bundle authority is malformed; explicit migration is required.'
+              : 'Persisted Evidence Bundle has no provable authority; explicit migration is required.';
+          live.disposition = 'deferred';
+          live.deferState = {
+            reviewerVersion: this.options.reviewerVersion ?? SKILL_EVOLUTION_REVIEWER_VERSION,
+            reason,
+            deferredAt: now.toISOString(),
+          };
+          live.terminalReason = reason;
+          live.nextDueAt = undefined;
+          live.updatedAt = now.toISOString();
+          upsertEvidenceReviewJob(state, live);
+          engine.saveStore(state);
+        }
+        continue;
+      }
+      if (migratedLegacyBundle) {
+        const candidate = this.extractCandidateFromBundle(migratedLegacyBundle);
+        this.supersedeStaleReviewJob(
+          engine,
+          current,
+          migratedLegacyBundle,
+          candidate,
+          'Persisted pre-authority Evidence Bundle migrated to an explicit authority successor.',
+          declaredRelevantRegistryReadSetFromBundle(migratedLegacyBundle),
+        );
+        supersededJobIds.push(current.jobId);
+        const successorJobId = engine.loadStore().jobs[current.jobId]?.successorJobId;
+        if (successorJobId) successorJobIds.push(successorJobId);
+        continue;
+      }
       const preFence = this.decideLiveReviewFence(
         current,
         this.normalizePersistedBundleForReReview(current.bundle),
@@ -1739,6 +1829,16 @@ export class SkillEvolutionRuntime {
 
   private isDeferredReviewEligible(job: EvidenceReviewJob, candidateBundle?: EvidenceBundle): boolean {
     if (job.disposition !== 'deferred') return false;
+    const normalizedBundle = migratePersistedEvidenceBundleAuthority(job.bundle);
+    if (!normalizedBundle) return false;
+    if (
+      normalizedBundle.authority.kind === 'learning-episode'
+      && !hasCompleteFrozenSourceEvidence(job.bundle)
+    ) {
+      return !!candidateBundle
+        && hasCompleteFrozenSourceEvidence(candidateBundle)
+        && hashEvidenceBundle(candidateBundle) !== job.basis.evidenceBundleHash;
+    }
     if (job.deferState
       && job.deferState.reviewerVersion !== (this.options.reviewerVersion ?? SKILL_EVOLUTION_REVIEWER_VERSION)) {
       return true;
@@ -1772,7 +1872,13 @@ export class SkillEvolutionRuntime {
       if (existing) return existing;
       throw new Error(`Deferred review job ${staleJob.jobId} is no longer eligible for reactivation.`);
     }
-    const normalized = this.normalizePersistedBundleForReReview(bundle);
+    const normalizedPersisted = this.normalizePersistedBundleForReReview(bundle);
+    const normalized = migratePersistedEvidenceBundleAuthority(normalizedPersisted);
+    if (!normalized) {
+      throw new Error(
+        `Deferred review job ${staleJob.jobId} has no migratable Evidence Bundle authority.`,
+      );
+    }
     const successor = createEvidenceReviewJob({
       bundle: normalized,
       candidate: this.extractCandidateFromBundle(normalized),
@@ -1944,6 +2050,7 @@ export class SkillEvolutionRuntime {
     const journal: TransitionJournal = {
       schemaVersion: SKILL_EVOLUTION_SCHEMA_VERSION,
       transitionId,
+      priorRegistryHash: stableHash(registry),
       targetRegistryHash: stableHash(target),
       targetRegistry: target,
       skillOperations: [],
@@ -2093,9 +2200,166 @@ export class SkillEvolutionRuntime {
         rationale: 'Runtime rejected a verifier result that attempted to change the author-proposed transition.',
       };
     }
-    const transition = verifier.decision === 'accept'
+    let transition = verifier.decision === 'accept'
       ? (verifier.transition ?? draft.envelope.decision)
       : verifier.decision === 'defer' ? 'defer' : 'reject_candidate';
+
+    const nonMutatingTransition = transition === 'defer' || transition === 'reject_candidate';
+    const targetHandle = draft.envelope.targetCapabilityHandle;
+    const authority = classifyEvidenceBundleAuthority(bundle);
+    if (verifier.decision === 'accept' && authority.malformedAuthority) {
+      transition = 'reject_candidate';
+      verifier = {
+        decision: 'reject',
+        issues: [{
+          code: 'malformed-bundle-authority',
+          message: 'Evidence Bundle authority is malformed; mutation is not permitted.',
+          severity: 'danger',
+        }],
+        rationale: 'Runtime rejected a transition whose explicit authority marker could not be validated.',
+      };
+    }
+    const isLearningEpisode = authority.family === 'learning-episode';
+    const isFlashcard = authority.family === 'flashcard';
+    const isSemanticReassessment = authority.family === 'semantic-reassessment';
+    const semanticEpisode = bundle.episode as { capabilityHandle?: unknown } | null;
+    const semanticTargetHandle = typeof semanticEpisode?.capabilityHandle === 'string'
+      ? semanticEpisode.capabilityHandle
+      : undefined;
+    const declaredSemanticTarget = authority.targetCapabilityHandle;
+    const semanticBundleTargetsEpisode = typeof declaredSemanticTarget === 'string'
+      && declaredSemanticTarget === semanticTargetHandle;
+    const semanticRelatedSkillsTargetEpisode = bundle.relatedCurrentSkills.length === 1
+      && bundle.relatedCurrentSkills[0]?.handle === semanticTargetHandle;
+    const semanticPriorGuidanceFrozen = typeof semanticTargetHandle === 'string'
+      && hasFrozenSemanticPriorGuidance(
+        bundle,
+        this.getRegistry().capabilities[semanticTargetHandle],
+      );
+    const semanticTransitionKindAllowed = transition === 'append_evidence'
+      || (
+        (transition === 'replace_current_skill' || transition === 'migrate_skill_route')
+        && semanticPriorGuidanceFrozen
+      );
+    const semanticTransitionAllowed = nonMutatingTransition || (
+      semanticTransitionKindAllowed
+      && semanticBundleTargetsEpisode
+      && semanticRelatedSkillsTargetEpisode
+      && semanticTargetHandle === targetHandle
+    );
+    if (
+      verifier.decision === 'accept'
+      && isSemanticReassessment
+      && !semanticTransitionAllowed
+    ) {
+      transition = 'reject_candidate';
+      verifier = {
+        decision: 'reject',
+        issues: [{
+          code: 'semantic-reassessment-scope',
+          message: 'Semantic reassessment may append evidence to its exact target; replacing or migrating executable guidance additionally requires a frozen prior-guidance body that matches the active Registry revision.',
+          severity: 'danger',
+        }],
+        rationale: 'Runtime rejected a semantic reassessment transition outside its exact target-bound authority.',
+      };
+    }
+    const usageEpisode = bundle.episode as { kind?: unknown; capabilityHandle?: unknown } | null;
+    const isUsageReassessment = authority.family === 'usage-reassessment';
+    const usageTargetHandle = usageEpisode?.kind === 'usage-reassessment'
+      && typeof usageEpisode.capabilityHandle === 'string'
+      && authority.targetCapabilityHandle === usageEpisode.capabilityHandle
+      ? authority.targetCapabilityHandle
+      : undefined;
+    // A usage bundle currently freezes only the fact that a named load was
+    // contradicted, not the bounded correction text or the prior guidance
+    // body. That is enough to retain negative evidence, but not enough to
+    // conclude that the whole Capability is disposable. Automatic usage
+    // reassessment therefore has one mutating outlet: append evidence. Full
+    // retirement remains an explicit operator action until a richer frozen
+    // correction contract exists.
+    const usageCurationTransitionAllowed = nonMutatingTransition || (
+      typeof usageTargetHandle === 'string'
+      && usageTargetHandle === targetHandle
+      && transition === 'append_evidence'
+    );
+    const learningAppendTargetsBoundedSkill = transition !== 'append_evidence'
+      || (
+        typeof targetHandle === 'string'
+        && learningAppendTargetIsEvidenceBound(
+          bundle,
+          this.getRegistry().capabilities[targetHandle],
+        )
+      );
+    const learningEpisodeTransitionAllowed = nonMutatingTransition
+      || transition === 'create_current_skill'
+      || (transition === 'append_evidence' && learningAppendTargetsBoundedSkill);
+    const usageTransitionExceedsAuthority = isUsageReassessment
+      && !usageCurationTransitionAllowed;
+    const learningTransitionExceedsAuthority = isLearningEpisode
+      && !learningEpisodeTransitionAllowed;
+    if (
+      verifier.decision === 'accept'
+      && (usageTransitionExceedsAuthority || learningTransitionExceedsAuthority)
+    ) {
+      const rejectCorrection = usageTransitionExceedsAuthority;
+      transition = rejectCorrection ? 'reject_candidate' : 'defer';
+      verifier = {
+        decision: rejectCorrection ? 'reject' : 'defer',
+        issues: [{
+          code: rejectCorrection ? 'usage-reassessment-scope' : 'learning-episode-scope',
+          message: rejectCorrection
+            ? 'Correction-bound reassessment may only append evidence until a bounded correction and prior-guidance snapshot exist; retirement remains an explicit operator action.'
+            : 'One Learning Episode may create a Skill or append evidence only to its bounded related-skill set; behavior replacement and structural catalog changes require dedicated evidence paths.',
+          severity: rejectCorrection ? 'danger' : 'error',
+        }],
+        rationale: rejectCorrection
+          ? 'Runtime rejected a transition that exceeded the target-bound authority of the correction.'
+          : 'Runtime deferred a structural catalog change that requires a dedicated evidence path.',
+      };
+    }
+    if (
+      verifier.decision === 'accept'
+      && isFlashcard
+      && !nonMutatingTransition
+      && transition !== 'create_current_skill'
+    ) {
+      transition = 'defer';
+      verifier = {
+        decision: 'defer',
+        issues: [{
+          code: 'flashcard-authority-scope',
+          message: 'The flashcard evidence path may create one bounded Current Skill; updates to existing capabilities require their dedicated evidence path.',
+          severity: 'error',
+        }],
+        rationale: 'Runtime deferred a flashcard transition outside its create-only authority.',
+      };
+    }
+    const operatorEpisode = bundle.episode as {
+      kind?: unknown;
+      action?: unknown;
+      capabilityHandle?: unknown;
+    } | null;
+    const operatorRetirementAllowed = authority.family === 'operator-control'
+      && authority.targetCapabilityHandle === targetHandle
+      && operatorEpisode?.kind === 'operator-skill-control'
+      && operatorEpisode.action === 'retire'
+      && operatorEpisode.capabilityHandle === targetHandle;
+    if (
+      verifier.decision === 'accept'
+      && transition === 'retire_capability'
+      && !operatorRetirementAllowed
+    ) {
+      transition = 'reject_candidate';
+      verifier = {
+        decision: 'reject',
+        issues: [{
+          code: 'retirement-requires-operator-control',
+          message: 'Generated Current Skill retirement requires the explicit operator-control path.',
+          severity: 'danger',
+        }],
+        rationale: 'Runtime rejected non-operator retirement authority.',
+      };
+    }
     let applied: AppliedTransition;
     const isCreateTransition = transition === 'create_current_skill' && verifier.decision === 'accept';
     const routingName = draft.envelope.routingName;
@@ -2513,6 +2777,7 @@ export function loadCurrentSkillRegistry(filePath: string): CurrentSkillRegistry
  */
 export function reconcileActiveGeneratedSkillArtifacts(
   state: CurrentSkillRegistryState,
+  outputDir: string,
 ): { state: CurrentSkillRegistryState; repaired: boolean } {
   let repaired = false;
   const capabilities: Record<string, CurrentSkillRecord> = { ...state.capabilities };
@@ -2521,8 +2786,22 @@ export function reconcileActiveGeneratedSkillArtifacts(
     if (!skillPath?.trim()) {
       throw new ActiveGeneratedSkillInvariantError(handle, String(skillPath), 'skillFilePath is empty');
     }
+    if (!isPathSafelyWithinDirectory(skillPath, outputDir)) {
+      throw new ActiveGeneratedSkillInvariantError(
+        handle,
+        skillPath,
+        'skillFilePath escapes the generated Skill root',
+      );
+    }
     if (!fs.existsSync(skillPath)) {
       const archivePath = path.join(path.dirname(skillPath), 'history', record.guidanceHash, 'SKILL.md');
+      if (!isPathSafelyWithinDirectory(archivePath, outputDir)) {
+        throw new ActiveGeneratedSkillInvariantError(
+          handle,
+          archivePath,
+          'history snapshot path escapes the generated Skill root',
+        );
+      }
       if (!fs.existsSync(archivePath)) {
         throw new ActiveGeneratedSkillInvariantError(
           handle,
@@ -2647,21 +2926,48 @@ function findIdempotentTransition(
   return { transitionId: committed.transitionId, record, audit: committed };
 }
 
-export function recoverTransitionJournal(paths: Pick<SkillEvolutionPaths, 'registryPath' | 'auditPath' | 'journalPath'>): boolean {
-  if (!fs.existsSync(paths.journalPath)) return false;
-  const journal = JSON.parse(fs.readFileSync(paths.journalPath, 'utf8')) as TransitionJournal;
+export function recoverTransitionJournal(
+  paths: Pick<SkillEvolutionPaths, 'outputDir' | 'registryPath' | 'auditPath' | 'journalPath'>,
+): boolean {
+  const journal = loadTransitionJournalForInspection(paths);
+  if (!journal) return false;
   if (journal.committedAt) {
     fs.unlinkSync(paths.journalPath);
     return true;
   }
   const current = loadCurrentSkillRegistry(paths.registryPath);
+  const currentRegistryHash = stableHash(current);
+  if (
+    journal.priorRegistryHash !== undefined
+    && currentRegistryHash !== journal.priorRegistryHash
+    && currentRegistryHash !== journal.targetRegistryHash
+  ) {
+    throw new Error(
+      `Transition journal Registry precondition no longer matches: current=${currentRegistryHash}`,
+    );
+  }
   // Apply file operations even when the Registry already reached its target:
   // a crash can happen between any two of the three durable replacements.
   for (const operation of journal.skillOperations) {
+    const currentHash = hashFile(operation.path);
     if (operation.delete) {
-      if (fs.existsSync(operation.path)) fs.unlinkSync(operation.path);
+      if (currentHash === undefined) continue;
+      if (operation.priorHash !== undefined && currentHash !== operation.priorHash) {
+        throw new Error(`Transition journal file precondition no longer matches at ${operation.path}.`);
+      }
+      fs.unlinkSync(operation.path);
     } else if (operation.content !== undefined) {
-      const currentHash = hashFile(operation.path);
+      if (
+        operation.priorHash !== undefined
+        && currentHash !== operation.expectedHash
+        && (
+          operation.priorHash === null
+            ? currentHash !== undefined
+            : currentHash !== operation.priorHash
+        )
+      ) {
+        throw new Error(`Transition journal file precondition no longer matches at ${operation.path}.`);
+      }
       if (operation.immutable && currentHash !== undefined && currentHash !== operation.expectedHash) {
         throw new Error(`Immutable guidance snapshot collision at ${operation.path}.`);
       }
@@ -2679,6 +2985,74 @@ export function recoverTransitionJournal(paths: Pick<SkillEvolutionPaths, 'regis
   writeJsonAtomic(paths.journalPath, { ...journal, committedAt: new Date().toISOString() });
   fs.unlinkSync(paths.journalPath);
   return true;
+}
+
+/**
+ * Read and validate a pending transition without applying or deleting it.
+ * Operator confirmation flows use this to describe a crash-recovery state
+ * without turning inspection into a write-capable action.
+ */
+export function loadTransitionJournalForInspection(
+  paths: Pick<SkillEvolutionPaths, 'outputDir' | 'journalPath'>,
+): TransitionJournal | undefined {
+  if (!fs.existsSync(paths.journalPath)) return undefined;
+  const journal = JSON.parse(fs.readFileSync(paths.journalPath, 'utf8')) as TransitionJournal;
+  // Validate the durable record before honoring even its metadata. A
+  // malformed or operator-tampered journal remains in place for inspection.
+  validateTransitionJournalForRecovery(journal, paths.outputDir);
+  return journal;
+}
+
+/** Validate every recovery-owned write target before replaying any operation. */
+function validateTransitionJournalForRecovery(
+  journal: TransitionJournal,
+  outputDir: string,
+): void {
+  if (
+    !isRecord(journal)
+    || !Number.isInteger(journal.schemaVersion)
+    || journal.schemaVersion < 1
+    || journal.schemaVersion > SKILL_EVOLUTION_SCHEMA_VERSION
+    || !isNonEmptyString(journal.transitionId)
+    || !isNonEmptyString(journal.targetRegistryHash)
+    || (journal.priorRegistryHash !== undefined && !isNonEmptyString(journal.priorRegistryHash))
+    || !isRecord(journal.targetRegistry)
+    || !Array.isArray(journal.skillOperations)
+    || !isRecord(journal.audit)
+    || journal.audit.transitionId !== journal.transitionId
+  ) {
+    throw new Error('Transition journal is malformed.');
+  }
+  validateRegistryState(journal.targetRegistry);
+  if (stableHash(journal.targetRegistry) !== journal.targetRegistryHash) {
+    throw new Error('Transition journal target Registry hash does not match its payload.');
+  }
+  for (const record of Object.values(journal.targetRegistry.capabilities)) {
+    if (!isPathSafelyWithinDirectory(record.skillFilePath, outputDir)) {
+      throw new Error(`Transition journal Registry path escapes the generated Skill root: ${record.skillFilePath}`);
+    }
+  }
+  for (const operation of journal.skillOperations) {
+    if (
+      !isRecord(operation)
+      || !isNonEmptyString(operation.path)
+      || !isPathSafelyWithinDirectory(operation.path, outputDir)
+      || (operation.delete !== true && typeof operation.content !== 'string')
+      || (operation.delete === true && operation.content !== undefined)
+      || (typeof operation.content === 'string' && !isNonEmptyString(operation.expectedHash))
+      || (
+        typeof operation.content === 'string'
+        && sha256(operation.content) !== operation.expectedHash
+      )
+      || (
+        operation.priorHash !== undefined
+        && operation.priorHash !== null
+        && !isNonEmptyString(operation.priorHash)
+      )
+    ) {
+      throw new Error('Transition journal contains an unsafe or malformed Skill operation.');
+    }
+  }
 }
 
 export function applyCapabilityTransition(input: ApplyTransitionInput): AppliedTransition {
@@ -2699,8 +3073,21 @@ export function applyCapabilityTransition(input: ApplyTransitionInput): AppliedT
     return idempotent;
   }
   const registryReadSet = normalizeRegistryReadSet(input.registryReadSet ?? []);
+  // Authority for target-bound mutations is evaluated against Registry state.
+  // Establish the optimistic-concurrency precondition first so a concurrent
+  // revision is classified as stale review work, not as an authority failure
+  // caused by comparing frozen evidence with a newer guidance revision.
   assertRegistryReadSetCurrent(registry, registryReadSet);
   assertTransitionTargetsWereRead(input, registryReadSet);
+  const authorityViolation = transitionAuthorityViolation(
+    input.bundle,
+    input.transition,
+    targetHandle,
+    registry,
+  );
+  if (authorityViolation) {
+    throw new Error(`Evidence Bundle mutation authority rejected: ${authorityViolation}`);
+  }
   const now = new Date().toISOString();
   const transitionId = `transition-${randomUUID()}`;
   const evidenceRefs = selectedEvidenceRefs(input.draft, input.bundle);
@@ -2745,7 +3132,12 @@ export function applyCapabilityTransition(input: ApplyTransitionInput): AppliedT
     };
     target.capabilities[handle] = resultingRecord;
     involved.push(handle);
-    operations.push({ path: skillPath, content, expectedHash: sha256(content) });
+    operations.push({
+      path: skillPath,
+      content,
+      expectedHash: sha256(content),
+      priorHash: null,
+    });
   } else if (input.transition === 'migrate_skill_route') {
     priorGuidanceHash = existing!.guidanceHash;
     const currentHash = hashFile(existing!.skillFilePath);
@@ -2777,19 +3169,28 @@ export function applyCapabilityTransition(input: ApplyTransitionInput): AppliedT
       path: path.join(path.dirname(existing!.skillFilePath), 'history', existing!.guidanceHash, 'SKILL.md'),
       content: previousContent,
       expectedHash: existing!.guidanceHash,
+      priorHash: null,
       immutable: true,
     });
-    operations.push({ path: existing!.skillFilePath, content, expectedHash: sha256(content) });
+    operations.push({
+      path: existing!.skillFilePath,
+      content,
+      expectedHash: sha256(content),
+      priorHash: existing!.guidanceHash,
+    });
   } else if (input.transition === 'replace_current_skill') {
     priorGuidanceHash = existing!.guidanceHash;
     const currentHash = hashFile(existing!.skillFilePath);
     if (currentHash !== existing!.guidanceHash) throw new Error('Active guidance hash does not match the Capability Registry.');
-    const content = renderCurrentSkill(input.draft, existing!.handle, transitionId, evidenceRefs);
+    const replacementDraft = input.draft.envelope.description?.trim()
+      ? input.draft
+      : { ...input.draft, envelope: { ...input.draft.envelope, description: existing!.description } };
+    const content = renderCurrentSkill(replacementDraft, existing!.handle, transitionId, evidenceRefs);
     resultingGuidanceHash = sha256(content);
     resultingRecord = {
       ...existing!,
       revision: existing!.revision + 1,
-      description: input.draft.envelope.description!.trim(),
+      description: replacementDraft.envelope.description!.trim(),
       guidanceHash: resultingGuidanceHash,
       guidanceContentHash: guidanceBodyHash(input.draft.body),
       evidenceRefs: mergeEvidence(existing!.evidenceRefs, evidenceRefs),
@@ -2804,18 +3205,24 @@ export function applyCapabilityTransition(input: ApplyTransitionInput): AppliedT
       path: historyPath,
       content: previousContent,
       expectedHash: existing!.guidanceHash,
+      priorHash: null,
       immutable: true,
     });
-    operations.push({ path: existing!.skillFilePath, content, expectedHash: sha256(content) });
+    operations.push({
+      path: existing!.skillFilePath,
+      content,
+      expectedHash: sha256(content),
+      priorHash: existing!.guidanceHash,
+    });
   } else if (input.transition === 'append_evidence') {
     priorGuidanceHash = existing!.guidanceHash;
     resultingGuidanceHash = existing!.guidanceHash;
     resultingRecord = {
       ...existing!,
-      // Evidence and reference metadata do not change the active guidance
-      // body, but they are still a durable Registry mutation. Advance the
-      // record revision so reviewers holding an older read set cannot
-      // overwrite the newly admitted evidence metadata.
+      // Evidence metadata may include runtime-proven dependencies and bounded
+      // semantic observations. It never changes active guidance, route, or
+      // guidance hash, but still advances the Registry revision so an older
+      // read set cannot overwrite the newly admitted evidence.
       revision: existing!.revision + 1,
       evidenceRefs: mergeEvidence(existing!.evidenceRefs, evidenceRefs),
       referencedSkills: input.draft.envelope.referencedSkills !== undefined
@@ -2841,12 +3248,42 @@ export function applyCapabilityTransition(input: ApplyTransitionInput): AppliedT
     };
     target.capabilities[existing!.handle] = resultingRecord;
     delete target.capabilities[source.handle];
-    operations.push({ path: source.skillFilePath, delete: true });
+    operations.push({
+      path: source.skillFilePath,
+      priorHash: source.guidanceHash,
+      delete: true,
+    });
   } else if (input.transition === 'retire_capability') {
     priorGuidanceHash = existing!.guidanceHash;
     resultingGuidanceHash = null;
-    operations.push({ path: existing!.skillFilePath, delete: true });
+    // Retirement must remain reversible.  Keep the exact active body in the
+    // immutable revision store before removing the Registry-owned artifact;
+    // recovery reuses the same journal semantics as replacement/merge.
+    const currentContent = fs.readFileSync(existing!.skillFilePath, 'utf8');
+    const currentHash = sha256(currentContent);
+    if (currentHash !== existing!.guidanceHash) {
+      throw new Error('Active guidance hash does not match the Capability Registry.');
+    }
+    operations.push({
+      path: path.join(path.dirname(existing!.skillFilePath), 'history', existing!.guidanceHash, 'SKILL.md'),
+      content: currentContent,
+      expectedHash: existing!.guidanceHash,
+      priorHash: null,
+      immutable: true,
+    });
+    operations.push({
+      path: existing!.skillFilePath,
+      priorHash: existing!.guidanceHash,
+      delete: true,
+    });
     delete target.capabilities[existing!.handle];
+    // A retired capability cannot remain the target of a route redirect: the
+    // Registry validator intentionally rejects redirects to missing handles.
+    // Explicit retirement therefore removes all aliases for this capability;
+    // the append-only transition audit retains their historical identity.
+    for (const [route, handle] of Object.entries(target.routeRedirects)) {
+      if (handle === existing!.handle) delete target.routeRedirects[route];
+    }
   }
 
   if (input.transition === 'create_current_skill'
@@ -2880,6 +3317,7 @@ export function applyCapabilityTransition(input: ApplyTransitionInput): AppliedT
   const journal: TransitionJournal = {
     schemaVersion: SKILL_EVOLUTION_SCHEMA_VERSION,
     transitionId,
+    priorRegistryHash: stableHash(registry),
     targetRegistryHash: stableHash(target),
     targetRegistry: target,
     skillOperations: operations,
@@ -2918,6 +3356,10 @@ export function restoreCapabilityRevision(input: RestoreCapabilityRevisionInput)
   if (!fs.existsSync(archivePath)) throw new Error(`Immutable guidance snapshot not found: ${input.guidanceHash}`);
   const content = fs.readFileSync(archivePath, 'utf8');
   if (sha256(content) !== input.guidanceHash) throw new Error('Immutable guidance snapshot hash mismatch.');
+  const restoredGuidanceContentHash = guidanceBodyHashFromFile(archivePath);
+  if (!restoredGuidanceContentHash) {
+    throw new Error('Immutable guidance snapshot has no valid executable guidance body.');
+  }
   const activeHash = hashFile(current.skillFilePath);
   if (activeHash !== current.guidanceHash) throw new Error('Active guidance hash does not match the Capability Registry.');
 
@@ -2928,7 +3370,7 @@ export function restoreCapabilityRevision(input: RestoreCapabilityRevisionInput)
     ...current,
     revision: current.revision + 1,
     guidanceHash: input.guidanceHash,
-    guidanceContentHash: guidanceBodyHash(content),
+    guidanceContentHash: restoredGuidanceContentHash,
     updatedAt: now,
   };
   target.capabilities[current.handle] = restored;
@@ -2938,9 +3380,15 @@ export function restoreCapabilityRevision(input: RestoreCapabilityRevisionInput)
       path: path.join(path.dirname(current.skillFilePath), 'history', current.guidanceHash, 'SKILL.md'),
       content: fs.readFileSync(current.skillFilePath, 'utf8'),
       expectedHash: current.guidanceHash,
+      priorHash: null,
       immutable: true,
     },
-    { path: current.skillFilePath, content, expectedHash: input.guidanceHash },
+    {
+      path: current.skillFilePath,
+      content,
+      expectedHash: input.guidanceHash,
+      priorHash: current.guidanceHash,
+    },
   ];
   const audit: TransitionAuditEntry = {
     schemaVersion: SKILL_EVOLUTION_SCHEMA_VERSION,
@@ -2963,6 +3411,7 @@ export function restoreCapabilityRevision(input: RestoreCapabilityRevisionInput)
   const journal: TransitionJournal = {
     schemaVersion: SKILL_EVOLUTION_SCHEMA_VERSION,
     transitionId,
+    priorRegistryHash: stableHash(registry),
     targetRegistryHash: stableHash(target),
     targetRegistry: target,
     skillOperations: operations,
@@ -2975,6 +3424,7 @@ export function restoreCapabilityRevision(input: RestoreCapabilityRevisionInput)
 
 function validateEvidenceBundle(bundle: EvidenceBundle): void {
   if (!bundle || !bundle.bundleId || bundle.episode == null) throw new Error('Evidence Bundle must contain an episode and bundleId.');
+  requireExplicitEvidenceBundleAuthority(bundle);
   if (!Array.isArray(bundle.completionEvidence) || bundle.completionEvidence.length === 0) throw new Error('Evidence Bundle is missing completion evidence.');
   if (!Array.isArray(bundle.settlementEvidence) || bundle.settlementEvidence.length === 0) throw new Error('Evidence Bundle is missing settlement evidence.');
   const completionRefs = bundle.completionEvidence.map(item => item.ref);
@@ -3007,18 +3457,27 @@ function validateEvidenceBundle(bundle: EvidenceBundle): void {
     }
   }
   if (bundle.sourceEvidence !== undefined) {
-    if (!Array.isArray(bundle.sourceEvidence)) throw new Error('Evidence Bundle source evidence is malformed.');
-    const sourceRefs = new Set(bundle.sourceEvidence.map(item => item.ref));
-    const sourceByRef = new Map(bundle.sourceEvidence.map(item => [item.ref, item]));
-    if (
-      bundle.sourceEvidence.some(item => !item.content?.trim())
-      || refs.some(ref => !sourceRefs.has(ref))
-      || bundle.completionEvidence.some(item => sourceByRef.get(item.ref)?.role !== 'problem-action')
-      || bundle.settlementEvidence.some(item => sourceByRef.get(item.ref)?.role !== 'verification')
-    ) {
-      throw new Error('Evidence Bundle source evidence is incomplete.');
-    }
+    const failure = validateFrozenSourceEvidence({
+      completionEvidence: bundle.completionEvidence,
+      settlementEvidence: bundle.settlementEvidence,
+      sourceEvidence: bundle.sourceEvidence,
+    });
+    if (failure) throw new Error(`Evidence Bundle source evidence is invalid: ${failure.message}`);
   }
+}
+
+/**
+ * Check the minimum provenance needed to replay an ordinary Learning Episode
+ * review without consulting its mutable source log. This is intentionally
+ * stricter than the legacy optional Bundle contract and is used only when
+ * quarantining already-persisted jobs from before source snapshots existed.
+ */
+function hasCompleteFrozenSourceEvidence(bundle: EvidenceBundle): boolean {
+  return !validateFrozenSourceEvidence({
+    completionEvidence: bundle.completionEvidence,
+    settlementEvidence: bundle.settlementEvidence,
+    sourceEvidence: bundle.sourceEvidence,
+  });
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -3146,7 +3605,8 @@ function validateDraft(draft: SkillDraft, bundle: EvidenceBundle, manualSkillNam
   if (Array.isArray(envelope?.evidenceRefs) && envelope!.evidenceRefs.some(ref => typeof ref !== 'string' || !availableEvidence.has(ref))) issues.push(issue('missing-evidence', 'Draft cites evidence outside the fixed Evidence Bundle.', 'danger'));
   const manualNames = new Set(manualSkillNames);
   if (envelope?.routingName && manualNames.has(envelope.routingName)) issues.push(issue('manual-collision', 'Generated skill cannot collide with a manually managed skill.', 'danger'));
-  if (UNSAFE_GUIDANCE_PATTERNS.some(pattern => pattern.test(draft?.body ?? ''))) issues.push(issue('privilege-expansion', 'Draft contains unsafe authority expansion or source-instruction contamination.', 'danger'));
+  const promptVisibleGuidance = `${draft?.body ?? ''}\n${envelope?.description ?? ''}`;
+  if (UNSAFE_GUIDANCE_PATTERNS.some(pattern => pattern.test(promptVisibleGuidance))) issues.push(issue('privilege-expansion', 'Draft contains unsafe authority expansion or source-instruction contamination.', 'danger'));
   if (envelope?.decision === 'create_current_skill' && envelope.targetCapabilityHandle) issues.push(issue('forged-handle', 'Runtime assigns the Capability Handle for a new capability.', 'danger'));
   if (envelope?.decision === 'create_current_skill' && (!envelope.routingName || typeof envelope.routingName !== 'string' || !envelope.description || typeof envelope.description !== 'string')) {
     issues.push(issue('creation-metadata', 'Current Skill creation requires a routing name and description.', 'danger'));
@@ -3206,7 +3666,7 @@ function validateTransitionInput(
     if (!routingName) throw new Error('Route migration requires a routing name.');
     if (!isValidRoutingName(routingName)) throw new Error('Skill Routing Name must be semantic kebab-case.');
     if (routingName === existing!.routingName) throw new Error('Route migration must change the public Routing Name.');
-    if (!isWithinDirectory(existing!.skillFilePath, input.outputDir)) {
+    if (!isPathSafelyWithinDirectory(existing!.skillFilePath, input.outputDir)) {
       throw new Error('Only generated Current Skills may use route migration.');
     }
     if (input.draft.body.toLowerCase().includes(existing!.routingName.toLowerCase())) {
@@ -3222,16 +3682,52 @@ function validateTransitionInput(
     if (!input.draft.envelope.sourceCapabilityHandle || input.draft.envelope.sourceCapabilityHandle === input.draft.envelope.targetCapabilityHandle) throw new Error('Merge requires distinct source and target Capability Handles.');
     if (!registry.capabilities[input.draft.envelope.sourceCapabilityHandle]) throw new Error('Merge source capability is not active.');
   }
-  if (input.transition === 'retire_capability' && !input.draft.envelope.targetCapabilityHandle) throw new Error('Retirement requires a target Capability Handle.');
+  if (input.transition === 'retire_capability') {
+    if (!input.draft.envelope.targetCapabilityHandle) throw new Error('Retirement requires a target Capability Handle.');
+    if (!isPathSafelyWithinDirectory(existing!.skillFilePath, input.outputDir)) {
+      throw new Error('Only generated Current Skills may be retired.');
+    }
+  }
 }
 
 function isValidRoutingName(value: string): boolean {
   return /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(value);
 }
 
-function isWithinDirectory(filePath: string, directoryPath: string): boolean {
-  const relative = path.relative(path.resolve(directoryPath), path.resolve(filePath));
-  return relative !== '' && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+export function isPathSafelyWithinDirectory(filePath: string, directoryPath: string): boolean {
+  const directory = path.resolve(directoryPath);
+  const target = path.resolve(filePath);
+  const relative = path.relative(directory, target);
+  if (
+    relative === ''
+    || relative === '..'
+    || relative.startsWith(`..${path.sep}`)
+    || path.isAbsolute(relative)
+    || !fs.existsSync(directory)
+  ) return false;
+
+  try {
+    const realDirectory = fs.realpathSync(directory);
+    let existingAncestor = target;
+    const missingSegments: string[] = [];
+    while (!fs.existsSync(existingAncestor)) {
+      const parent = path.dirname(existingAncestor);
+      if (parent === existingAncestor) return false;
+      missingSegments.unshift(path.basename(existingAncestor));
+      existingAncestor = parent;
+    }
+    const prospectiveRealPath = path.resolve(
+      fs.realpathSync(existingAncestor),
+      ...missingSegments,
+    );
+    const realRelative = path.relative(realDirectory, prospectiveRealPath);
+    return realRelative !== ''
+      && realRelative !== '..'
+      && !realRelative.startsWith(`..${path.sep}`)
+      && !path.isAbsolute(realRelative);
+  } catch {
+    return false;
+  }
 }
 
 function renderCurrentSkill(draft: SkillDraft, handle: string, transitionId: string, evidenceRefs: string[]): string {
@@ -3264,6 +3760,126 @@ function guidanceBodyHashFromFile(filePath: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+function hasFrozenSemanticPriorGuidance(
+  bundle: EvidenceBundle,
+  record: CurrentSkillRecord | undefined,
+): boolean {
+  if (!record) return false;
+  const ref = semanticPriorGuidanceEvidenceRef(record.handle, record.guidanceHash);
+  if (!bundle.completionEvidence.some(item => item.ref === ref)) return false;
+  const source = bundle.sourceEvidence?.find(item => item.ref === ref);
+  if (!source || source.role !== 'problem-action' || !source.content.trim()) return false;
+  const expectedGuidanceContentHash = record.guidanceContentHash
+    ?? guidanceBodyHashFromFile(record.skillFilePath);
+  return typeof expectedGuidanceContentHash === 'string'
+    && guidanceBodyHash(source.content) === expectedGuidanceContentHash;
+}
+
+/**
+ * Last-line write authorization. Review policy may turn violations into a
+ * semantic reject/defer earlier, but every exported mutation caller reaches
+ * this same family/target/transition check before a journal can be written.
+ */
+function transitionAuthorityViolation(
+  bundle: EvidenceBundle,
+  transition: CapabilityTransitionKind,
+  targetHandle: string | undefined,
+  registry: CurrentSkillRegistryState,
+): string | undefined {
+  if (transition === 'defer' || transition === 'reject_candidate') return undefined;
+  const authority = requireExplicitEvidenceBundleAuthority(bundle);
+  if (authority.kind === 'flashcard') {
+    return transition === 'create_current_skill'
+      ? undefined
+      : 'flashcard authority permits Current Skill creation only';
+  }
+  if (authority.kind === 'learning-episode') {
+    if (transition === 'create_current_skill') return undefined;
+    if (
+      transition === 'append_evidence'
+      && typeof targetHandle === 'string'
+      && learningAppendTargetIsEvidenceBound(bundle, registry.capabilities[targetHandle])
+    ) return undefined;
+    return 'learning-episode authority permits create or evidence-proven bounded-target append only';
+  }
+  if (authority.kind === 'usage-reassessment') {
+    const episode = bundle.episode as { kind?: unknown; capabilityHandle?: unknown } | null;
+    if (
+      transition === 'append_evidence'
+      && targetHandle === authority.targetCapabilityHandle
+      && episode?.kind === 'usage-reassessment'
+      && episode.capabilityHandle === targetHandle
+      && bundle.relatedCurrentSkills.length === 1
+      && bundle.relatedCurrentSkills[0]?.handle === targetHandle
+    ) return undefined;
+    return 'usage-reassessment authority permits exact-target evidence append only';
+  }
+  if (authority.kind === 'semantic-reassessment') {
+    const episode = bundle.episode as { capabilityHandle?: unknown } | null;
+    const exactTarget = typeof targetHandle === 'string'
+      && targetHandle === authority.targetCapabilityHandle
+      && episode?.capabilityHandle === targetHandle
+      && bundle.relatedCurrentSkills.length === 1
+      && bundle.relatedCurrentSkills[0]?.handle === targetHandle;
+    if (!exactTarget) return 'semantic-reassessment authority is not exact-target bound';
+    if (transition === 'append_evidence') return undefined;
+    if (
+      (transition === 'replace_current_skill' || transition === 'migrate_skill_route')
+      && hasFrozenSemanticPriorGuidance(bundle, registry.capabilities[targetHandle])
+    ) return undefined;
+    return 'semantic guidance rewrite requires a matching frozen prior-guidance body';
+  }
+  const episode = bundle.episode as {
+    kind?: unknown;
+    action?: unknown;
+    capabilityHandle?: unknown;
+  } | null;
+  if (
+    transition === 'retire_capability'
+    && targetHandle === authority.targetCapabilityHandle
+    && episode?.kind === 'operator-skill-control'
+    && episode.action === 'retire'
+    && episode.capabilityHandle === targetHandle
+  ) return undefined;
+  return 'operator-control authority permits exact-target retirement only';
+}
+
+function learningAppendTargetIsEvidenceBound(
+  bundle: EvidenceBundle,
+  record: CurrentSkillRecord | undefined,
+): boolean {
+  if (!record) return false;
+  const relatedSnapshotMatches = bundle.relatedCurrentSkills.some(skill => (
+    skill.handle === record.handle
+    && skill.revision === record.revision
+    && skill.routingName === record.routingName
+    && skill.guidanceHash === record.guidanceHash
+  ));
+  if (!relatedSnapshotMatches) return false;
+
+  const referencedSnapshotMatches = bundle.referencedSkills.some(skill => (
+    skill.capabilityHandle === record.handle
+    && skill.name === record.routingName
+    && skill.guidanceHash === record.guidanceHash
+  ));
+  const runtimeProvenanceMatches = bundle.referencedSkillProvenance?.kind
+    === 'runtime-owned-generated-skill-load-v1'
+    && bundle.referencedSkillProvenance.referencedSkills.some(skill => (
+      skill.capabilityHandle === record.handle
+      && skill.routingName === record.routingName
+      && skill.guidanceHash === record.guidanceHash
+    ));
+  if (referencedSnapshotMatches && runtimeProvenanceMatches) return true;
+
+  return [
+    ...(bundle.sourceEvidence ?? []).map(evidence => evidence.content),
+    ...(bundle.semanticObservations ?? []).map(observation => observation.value),
+  ].some(text => (
+    containsExactStableIdentifier(text, record.handle)
+    || containsExactStableIdentifier(text, record.routingName)
+  ));
 }
 
 function referencedSkillSnapshots(draft: SkillDraft, bundle: EvidenceBundle): ReferencedSkillSnapshot[] {

@@ -45,6 +45,7 @@ import { acceptReviewObligations } from './evidence-review-test-fixtures';
 function fixtureBundle(bundleId: string): EvidenceBundle {
   return {
     bundleId,
+    authority: { kind: 'learning-episode', episodeId: bundleId },
     episode: { problem: 'Create a card', completion: 'card delivered' },
     completionEvidence: [{ ref: 'session.jsonl#12' }],
     settlementEvidence: [{ ref: 'session.jsonl#13' }],

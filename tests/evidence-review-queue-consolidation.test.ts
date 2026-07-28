@@ -47,12 +47,25 @@ function candidate(id: string): DistilledKnowledgeCandidate {
 function bundle(id: string): EvidenceBundle {
   return {
     bundleId: id,
+    authority: { kind: 'learning-episode', episodeId: id },
     episode: candidate(id),
     completionEvidence: [{ ref: 'session.jsonl#1' }],
     settlementEvidence: [{ ref: 'session.jsonl#2' }],
     boundedContinuity: [],
     referencedSkills: [],
     relatedCurrentSkills: [],
+    sourceEvidence: [
+      {
+        ref: 'session.jsonl#1',
+        role: 'problem-action',
+        content: 'The bounded task was requested and completed.',
+      },
+      {
+        ref: 'session.jsonl#2',
+        role: 'verification',
+        content: 'The completed result was verified.',
+      },
+    ],
   };
 }
 
@@ -255,6 +268,70 @@ describe('Evidence Review Job single-owner consolidation', () => {
         false,
         'a collision successor must not trust quanta from the corrupted basis',
       );
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  test('an active legacy Learning Episode job stays dormant until frozen source evidence is migrated', () => {
+    const env = setup();
+    try {
+      const legacyBundle: EvidenceBundle = {
+        ...bundle('v3:learning-episode:episode-legacy-active-no-source'),
+        authority: undefined,
+        episode: candidate('episode-capability-legacy-active-no-source'),
+        sourceEvidence: undefined,
+      };
+      const legacy = createEvidenceReviewJob({
+        bundle: legacyBundle,
+        candidate: legacyBundle.episode as DistilledKnowledgeCandidate,
+        workClass: 'live_learning',
+        reviewPolicyVersion: 'evidence-review-policy-v6',
+        now: new Date(NOW),
+      });
+      const seeded = loadEvidenceReviewJobStore(env.jobStorePath);
+      seeded.jobs[legacy.jobId] = legacy;
+      saveEvidenceReviewJobStore(env.jobStorePath, seeded);
+
+      const runtime = new SkillEvolutionRuntime(env.options);
+      const fenced = runtime.fenceStaleActiveJobsBeforeFairAdvance(new Date(NOW));
+      assert.deepEqual(fenced, { supersededJobIds: [], successorJobIds: [] });
+
+      const dormant = runtime.getEvidenceReviewEngine().loadStore().jobs[legacy.jobId]!;
+      assert.equal(dormant.disposition, 'deferred');
+      assert.match(dormant.deferState?.reason ?? '', /no complete frozen source evidence/);
+      assert.equal(dormant.nextDueAt, undefined);
+      assert.equal(
+        Object.values(dormant.quanta).some(quantum => quantum.attempts > 0),
+        false,
+        'no reader, author, or verifier quantum should be claimed',
+      );
+
+      assert.deepEqual(
+        runtime.reactivateDeferredReviews(),
+        [],
+        'review policy changes alone cannot make missing evidence replayable',
+      );
+
+      const migratedBundle: EvidenceBundle = {
+        ...legacyBundle,
+        sourceEvidence: [
+          {
+            ref: 'session.jsonl#1',
+            role: 'problem-action',
+            content: 'A bounded task was requested and handled.',
+          },
+          {
+            ref: 'session.jsonl#2',
+            role: 'verification',
+            content: 'The result was verified.',
+          },
+        ],
+      };
+      const [successor] = runtime.reactivateDeferredReviews([migratedBundle]);
+      assert.ok(successor);
+      assert.equal(successor.bundle.sourceEvidence?.length, 2);
+      assert.equal(successor.disposition, 'active');
     } finally {
       env.cleanup();
     }

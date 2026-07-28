@@ -7,8 +7,6 @@ import { ServiceManager } from './service-manager';
 import { bootstrapDefaultSkillHubSkillsOnce } from '../skillhub/default-skill-bootstrap';
 import { createDashboardAuth } from './auth';
 import { startRuntimeCommandSupport, stopRuntimeCommandSupport } from '../utils/runtime-command-support';
-import { startReviewHeartbeatOwner, type ReviewHeartbeatOwner } from '../review/review-heartbeat-owner';
-import { startReviewWorkbenchOwner, type ReviewWorkbenchOwner } from '../review/review-workbench-owner';
 
 const DEFAULT_PORT = 3800;
 const activeServers: Server[] = [];
@@ -40,24 +38,6 @@ export async function startDashboard(
   // cross-process election when launched independently, but a dashboard-only
   // deployment must never have zero heartbeat owners.
   await startRuntimeCommandSupport(projectRoot);
-  let reviewHeartbeatOwner: ReviewHeartbeatOwner | undefined;
-  let reviewWorkbenchOwner: ReviewWorkbenchOwner | undefined;
-  try {
-    reviewHeartbeatOwner = await startReviewHeartbeatOwner({ projectRoot });
-  } catch (error) {
-    Logger.warning(`Review Heartbeat owner failed to start: ${error instanceof Error ? error.message : String(error)}`);
-  }
-  try {
-    reviewWorkbenchOwner = await startReviewWorkbenchOwner({ projectRoot });
-  } catch (error) {
-    Logger.warning(`Review Workbench owner failed to start: ${error instanceof Error ? error.message : String(error)}`);
-  }
-  const stopReviewOwners = async () => {
-    const owners = [reviewHeartbeatOwner, reviewWorkbenchOwner].filter(Boolean) as Array<{ stop(): Promise<void> }>;
-    reviewHeartbeatOwner = undefined;
-    reviewWorkbenchOwner = undefined;
-    await Promise.all(owners.map(owner => owner.stop()));
-  };
 
   app.use(express.json({ limit: '25mb' }));
 
@@ -94,12 +74,9 @@ export async function startDashboard(
     if (shuttingDown) return;
     shuttingDown = true;
     try {
-      await Promise.all([
-        serviceManager.drainAll(),
-        stopReviewOwners(),
-      ]);
+      await serviceManager.drainAll();
     } catch (error) {
-      Logger.warning(`Runtime drain failed during shutdown: ${error instanceof Error ? error.message : String(error)}`);
+      Logger.warning(`Service drain failed during shutdown: ${error instanceof Error ? error.message : String(error)}`);
     }
     await stopRuntimeCommandSupport();
     process.exit(0);
@@ -126,10 +103,7 @@ export async function startDashboard(
     async stop(): Promise<void> {
       // Await service drain before closing HTTP servers so an active
       // heartbeat wake can finish within the configured Review Deadline.
-      await Promise.all([
-        serviceManager.drainAll(),
-        stopReviewOwners(),
-      ]);
+      await serviceManager.drainAll();
       await stopRuntimeCommandSupport();
       await Promise.all(activeServers.splice(0).map(closeServer));
     },

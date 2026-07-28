@@ -116,6 +116,13 @@ function makeExternalEpisode(
       },
     ],
     contradictionSignals: [],
+    sourceEvidence: [{
+      ref: 'external://event/pi/pi-thread-1/evt-001#turn-4:delivery',
+      role: 'problem-action',
+      content: 'User:\nDeliver the requested artifact.\n\nAssistant:\nThe artifact was delivered.',
+      sourceFilePath: 'external://event/pi/pi-thread-1/evt-001',
+      turn: 4,
+    }],
     semanticObservations: [
       {
         kind: 'user-intent',
@@ -247,6 +254,36 @@ function matureExternalCapsule(
 }
 
 describe('settlement-evidence consistency (external Pi/DeepSeek regression)', () => {
+  test('capsule replay ignores settlement-only drift but rejects immutable evidence drift', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-settlement-upsert-'));
+    try {
+      const capsuleStore = new EvidenceCapsuleStore(path.join(root, 'capsules.json'));
+      const settlingEpisode = makeExternalEpisode({ status: 'settling' });
+      admitExternalCapsule(capsuleStore, settlingEpisode);
+      const bundleId = `v3:learning-episode:${settlingEpisode.episodeId}`;
+      const admissionCapsule = capsuleStore.findByBundleId(bundleId)!;
+
+      matureExternalCapsule(capsuleStore, {
+        ...settlingEpisode,
+        status: 'eligible',
+      });
+
+      assert.doesNotThrow(() => capsuleStore.upsert(admissionCapsule));
+      assert.equal(capsuleStore.count(), 1);
+      assert.throws(
+        () => capsuleStore.upsert({
+          ...admissionCapsule,
+          completionEvidence: admissionCapsule.completionEvidence.map((entry, index) => (
+            index === 0 ? { ...entry, content: `${entry.content} changed` } : entry
+          )),
+        }),
+        /immutable integrity conflict/,
+      );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test('admission capsule for a settling episode never labels it settled and exposes no contradiction', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-settlement-admission-'));
     try {

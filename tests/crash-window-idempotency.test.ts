@@ -45,8 +45,10 @@ import type { SessionTurnLogEntry } from '../src/utils/session-log-schema';
 /** Real adapter with controllable ACK failure to simulate the crash window. */
 class CrashSimAdapter extends ExternalSessionLogSourceAdapter {
   shouldFailAck = false;
+  acknowledgeCalls = 0;
   acknowledge(resource: SessionLogSourceResource, result: SessionLogSourceReadResult): void {
     if (this.shouldFailAck) throw new Error('simulated crash: cursor ACK failed');
+    this.acknowledgeCalls += 1;
     super.acknowledge(resource, result);
   }
 }
@@ -65,8 +67,12 @@ function makeUnit(turn: number): DistillationUnit {
     entry_type: 'turn', turn, timestamp: '2026-01-01T00:00:00.000Z',
     session_id: 'session-crash-window-1', session_type: 'chat',
     user: { text: 'Please deliver the report.' },
-    assistant: { text: 'Delivering.', tool_calls: [{ id: `t-${turn}`, name: 'send_file',
-      arguments: { target: 'report.pdf' }, result: 'ok', duration_ms: 100 }] },
+    assistant: { text: 'The report was delivered and validated.', tool_calls: [
+      { id: `t-${turn}`, name: 'send_file',
+        arguments: { target: 'report.pdf' }, result: 'ok', duration_ms: 100 },
+      { id: `v-${turn}`, name: 'validate_report',
+        arguments: { target: 'report.pdf' }, result: 'passed', duration_ms: 50 },
+    ] },
     tokens: { prompt: 10, completion: 20 },
   };
   return {
@@ -76,16 +82,20 @@ function makeUnit(turn: number): DistillationUnit {
   };
 }
 
-function makePage(unit: DistillationUnit): ExternalEvidencePage {
+function makePage(
+  unit: DistillationUnit,
+  eventIdentity: SourceEventIdentity = EVENT_IDENTITY,
+): ExternalEvidencePage {
   return {
     providerId: 'codex', sourceId: 'codex-thread-1',
-    identity: SOURCE_IDENTITY, resource: RESOURCE,
-    distillationUnits: [unit], eventIdentities: [EVENT_IDENTITY],
+    identity: SOURCE_IDENTITY,
+    resource: { ...RESOURCE, firstEventIdentity: eventIdentity },
+    distillationUnits: [unit], eventIdentities: [eventIdentity],
     readResult: {
       distillationUnit: unit, distillationUnits: [unit], advanced: true,
       status: 'advanced' as const,
       newCursor: { resourceRef: 'r1', position: 1, processedCount: 1 },
-      eventIdentities: [EVENT_IDENTITY],
+      eventIdentities: [eventIdentity],
       accounting: { events: 1, bytes: 500, elapsedMs: 0 },
     } as SessionLogSourceReadResult,
     lane: 'continuous' as const,
@@ -152,6 +162,10 @@ describe('crash-window idempotency (real restart/replay)', () => {
       const bundleId = `v3:learning-episode:${episodeId}`;
       const capsule1 = runtime1.getEvidenceCapsuleStore().findByBundleId(bundleId);
       assert.ok(capsule1, 'capsule durably persisted before ACK');
+      assert.match(capsule1!.completionEvidence[0]!.content, /Please deliver the report/);
+      assert.match(capsule1!.completionEvidence[0]!.content, /delivered and validated/);
+      assert.ok(capsule1!.completionEvidence.some(entry => entry.role === 'verification'));
+      assert.deepEqual(capsule1!.completionEvidence[0]!.byteRange, { start: 0, end: 500 });
 
       // Cursor not advanced.
       assert.equal(loadExternalCursorState(adapter1.getCursorStorePath()!).cursors['r1'], undefined,
@@ -189,6 +203,36 @@ describe('crash-window idempotency (real restart/replay)', () => {
       const ids = provenance.getEpisodeIdsForEvent(SOURCE_IDENTITY, EVENT_IDENTITY);
       assert.ok(ids.includes(episodeId), 'provenance maps event to original episode');
       assert.equal(new Set(ids).size, ids.length, 'no duplicate episode ids in provenance');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('immutable capsule conflict blocks production replay acknowledgement', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-capsule-conflict-'));
+    try {
+      const adapter = makeAdapter(root);
+      const runtime = createRuntime(root, adapter);
+      const first = runtime.getExternalAdmissionCoordinator().admitPage(makePage(makeUnit(4)), ['codex']);
+      assert.equal(first.acknowledged, true);
+      assert.equal(adapter.acknowledgeCalls, 1);
+
+      const conflictingIdentity: SourceEventIdentity = {
+        ...EVENT_IDENTITY,
+        contentHash: 'hash-crash-window-CONFLICT',
+      };
+      const replay = runtime.getExternalAdmissionCoordinator().admitPage(
+        makePage(makeUnit(4), conflictingIdentity),
+        ['codex'],
+      );
+
+      assert.equal(replay.acknowledged, false);
+      assert.match(replay.error?.message ?? '', /immutable integrity conflict/);
+      assert.equal(adapter.acknowledgeCalls, 1, 'conflicting replay must not reach provider ACK');
+      assert.equal(
+        runtime.getExternalSourceFailureState().get(SOURCE_IDENTITY.sourceId)?.failureClass,
+        'integrity_conflict',
+      );
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

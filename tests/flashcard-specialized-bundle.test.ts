@@ -5,11 +5,11 @@ import type { LearningEpisode, EpisodeEvidenceRef } from '../src/utils/learning-
 import type { ReferencedSkillSnapshot } from '../src/utils/skill-evolution';
 
 /**
- * Progressive Trust: specialized, explicitly constructed bundles may continue
- * to declare a known dependency when their evidence contract verifies it. The
+ * Progressive Trust: the explicit flashcard bundle may continue to declare a
+ * known dependency when its evidence contract verifies it. The
  * flashcard composition adapter explicitly pins `word-card-maker`. Ordinary
  * bundle construction no longer copies the complete Skill catalog into
- * referencedSkills, but this specialized bundle is built directly and must be
+ * referencedSkills, but this flashcard bundle is built directly and must be
  * preserved unchanged.
  */
 
@@ -34,7 +34,7 @@ function makeFlashcardEpisode(): LearningEpisode {
   } as LearningEpisode;
 }
 
-describe('flashcard specialized bundle preservation (progressive trust)', () => {
+describe('flashcard bundle preservation (progressive trust)', () => {
   test('buildFlashcardEvidenceBundle explicitly pins word-card-maker in referencedSkills', () => {
     const referencedSkill: ReferencedSkillSnapshot = {
       name: 'word-card-maker',
@@ -46,14 +46,18 @@ describe('flashcard specialized bundle preservation (progressive trust)', () => 
       referencedSkill,
     );
 
-    // The specialized bundle declares its known dependency directly; ordinary
+    // The flashcard bundle declares its known dependency directly; ordinary
     // catalog-exclusion rules do not strip it.
     assert.equal(bundle.referencedSkills.length, 1);
     assert.equal(bundle.referencedSkills[0]!.name, 'word-card-maker');
     assert.equal(bundle.referencedSkills[0]!.version, '1.0.0');
-    // relatedCurrentSkills is intentionally empty for this specialized bundle.
+    // relatedCurrentSkills is intentionally empty for this flashcard bundle.
     assert.deepEqual(bundle.relatedCurrentSkills, []);
     assert.equal(bundle.bundleId, 'flashcard-episode-flashcard-specialized');
+    assert.deepEqual(bundle.authority, {
+      kind: 'flashcard',
+      episodeId: 'episode-flashcard-specialized',
+    });
   });
 
   test('buildFlashcardEvidenceBundle requires validated delivery, validation, and acceptance evidence', () => {
