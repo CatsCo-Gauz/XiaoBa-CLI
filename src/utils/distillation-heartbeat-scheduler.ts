@@ -98,6 +98,8 @@ export class DistillationHeartbeatScheduler {
   private readonly pendingWakeReasons = new Set<RuntimeLearningReason>();
   private activeWake: Promise<RuntimeLearningHeartbeatResult> | null = null;
   private scheduledWake: Promise<void> | null = null;
+  /** Monotonically increases across starts to fence delayed stop callbacks. */
+  private lifecycleGeneration = 0;
   /**
    * Consecutive count of reschedules where the planner returned a due
    * deadline in the past (deadlineDelta === 0). Each consecutive immediate
@@ -159,6 +161,8 @@ export class DistillationHeartbeatScheduler {
       return;
     }
 
+    this.lifecycleGeneration += 1;
+    const startGeneration = this.lifecycleGeneration;
     this.started = true;
     this.stopped = false;
     const heartbeat = this.runtimeLearning?.loadHeartbeatRecord?.();
@@ -174,7 +178,7 @@ export class DistillationHeartbeatScheduler {
 
     const startupWake = (async () => {
       await this.runHeartbeat('startup');
-      if (!this.stopped) {
+      if (!this.stopped && this.lifecycleGeneration === startGeneration) {
         this.scheduleNextRun();
       }
     })();
@@ -183,6 +187,16 @@ export class DistillationHeartbeatScheduler {
   }
 
   async stop(): Promise<boolean> {
+    const stopGeneration = this.lifecycleGeneration;
+    const releaseOwnerIfStillStopped = () => {
+      if (
+        this.stopped
+        && !this.started
+        && this.lifecycleGeneration === stopGeneration
+      ) {
+        this.ownerLock?.release();
+      }
+    };
     this.stopped = true;
     this.started = false;
     this.stopSessionLogAppendWatcher();
@@ -227,8 +241,8 @@ export class DistillationHeartbeatScheduler {
         // supervisor kills this process). Releasing at the deadline would let
         // a new connector take over while the old writer is still alive.
         void awaitableWake.then(
-          () => this.ownerLock?.release(),
-          () => this.ownerLock?.release(),
+          releaseOwnerIfStillStopped,
+          releaseOwnerIfStillStopped,
         );
       }
       if (activeWakeCompleted) {
@@ -244,7 +258,9 @@ export class DistillationHeartbeatScheduler {
           });
         }
       }
-      this.activeWake = null;
+      if (activeWakeCompleted && this.activeWake === awaitableWake) {
+        this.activeWake = null;
+      }
     }
 
     if (this.scheduledWake) {
@@ -299,8 +315,8 @@ export class DistillationHeartbeatScheduler {
           // Keep the process-wide writer lease until an over-deadline backfill
           // or wake actually leaves the RuntimeLearning writer boundary.
           void waitForDrain.call(this.runtimeLearning).then(
-            () => this.ownerLock?.release(),
-            () => this.ownerLock?.release(),
+            releaseOwnerIfStillStopped,
+            releaseOwnerIfStillStopped,
           );
         }
       }
@@ -350,6 +366,9 @@ export class DistillationHeartbeatScheduler {
       let isCoalescedWake = false;
       while (!this.stopped && this.pendingWakeReasons.size > 0) {
           const nextReasons = [...this.pendingWakeReasons];
+          if (nextReasons.includes('session-log-append')) {
+            this.clearSessionLogAppendWakeTimer();
+          }
           try {
             this.runtimeLearning.markHeartbeatInProgress?.(
               nextReasons,
@@ -377,12 +396,12 @@ export class DistillationHeartbeatScheduler {
       return lastResult;
     };
 
-    this.activeWake = wakeCycle();
+    const wakePromise = wakeCycle();
+    this.activeWake = wakePromise;
     try {
-      const result = await this.activeWake;
-      return result;
+      return await wakePromise;
     } finally {
-      if (this.activeWake) {
+      if (this.activeWake === wakePromise) {
         this.activeWake = null;
       }
     }
@@ -406,10 +425,22 @@ export class DistillationHeartbeatScheduler {
     }
 
     if (this.sessionLogAppendWakeTimer) return;
+    const requestGeneration = this.lifecycleGeneration;
     this.sessionLogAppendWakeTimer = setTimeout(() => {
       this.sessionLogAppendWakeTimer = null;
+      if (
+        this.stopped
+        || !this.started
+        || this.lifecycleGeneration !== requestGeneration
+      ) {
+        return;
+      }
       void this.runHeartbeat('session-log-append')
-        .then(() => this.rescheduleAfterEventWake())
+        .then(() => {
+          if (this.lifecycleGeneration === requestGeneration) {
+            this.rescheduleAfterEventWake();
+          }
+        })
         .catch(error => {
           Logger.warning(`[DistillationHeartbeat] session append wake failed: ${error instanceof Error ? error.message : String(error)}`);
         });
@@ -439,11 +470,14 @@ export class DistillationHeartbeatScheduler {
     );
   }
 
+  private clearSessionLogAppendWakeTimer(): void {
+    if (!this.sessionLogAppendWakeTimer) return;
+    clearTimeout(this.sessionLogAppendWakeTimer);
+    this.sessionLogAppendWakeTimer = null;
+  }
+
   private stopSessionLogAppendWatcher(): void {
-    if (this.sessionLogAppendWakeTimer) {
-      clearTimeout(this.sessionLogAppendWakeTimer);
-      this.sessionLogAppendWakeTimer = null;
-    }
+    this.clearSessionLogAppendWakeTimer();
     if (!this.sessionLogAppendSignalListener || !this.sessionLogAppendSignalPath) return;
     fs.unwatchFile(
       this.sessionLogAppendSignalPath,
@@ -563,10 +597,18 @@ export class DistillationHeartbeatScheduler {
       } : undefined,
     );
 
+    const scheduledGeneration = this.lifecycleGeneration;
     this.timer = setTimeout(() => {
+      if (
+        this.stopped
+        || !this.started
+        || this.lifecycleGeneration !== scheduledGeneration
+      ) {
+        return;
+      }
       const scheduledTask = (async () => {
         await this.runHeartbeat(wakeReason);
-        if (!this.stopped) {
+        if (!this.stopped && this.lifecycleGeneration === scheduledGeneration) {
           this.scheduleNextRun();
         }
       })();

@@ -104,6 +104,40 @@ describe('session log heartbeat wake', () => {
     }
   });
 
+  test('does not repeat an append wake after an active wake consumes its pending reason', async () => {
+    const runtime = createRuntimeHarness();
+    let finishManual!: () => void;
+    const manualGate = new Promise<void>(resolve => { finishManual = resolve; });
+    runtime.value.wake = async (reason: string | string[]) => {
+      const reasons = (Array.isArray(reason) ? reason : [reason]).slice().sort();
+      runtime.wakes.push(reasons);
+      runtime.events.push('wake');
+      if (reasons.includes('manual')) await manualGate;
+      return { ran: true };
+    };
+    const scheduler = new DistillationHeartbeatScheduler(root, runtime.value as any);
+    try {
+      await scheduler.start();
+      await waitFor(() => runtime.wakes.length >= 1);
+      runtime.wakes.length = 0;
+
+      const manualWake = scheduler.runHeartbeat('manual');
+      await waitFor(() => runtime.wakes.some(reasons => reasons.includes('manual')));
+      scheduler.requestWake('session-log-append');
+      finishManual();
+      await manualWake;
+      await delay(1_250);
+
+      assert.deepEqual(runtime.wakes, [
+        ['manual'],
+        ['session-log-append'],
+      ]);
+    } finally {
+      finishManual();
+      await scheduler.stop();
+    }
+  });
+
   test('replaces a six-hour timer when a real append creates earlier due work', async () => {
     const runtime = createRuntimeHarness();
     const scheduler = new DistillationHeartbeatScheduler(root, runtime.value as any);
@@ -248,6 +282,56 @@ describe('session log heartbeat wake', () => {
     finishSecond();
     activeWakeResults.delete(second);
     await waiting;
+  });
+
+  test('does not release the owner lease when a timed-out stop is followed by restart', async () => {
+    const runtime = createRuntimeHarness();
+    let finishManual!: () => void;
+    const manualGate = new Promise<void>(resolve => { finishManual = resolve; });
+    runtime.value.wake = async (reason: string | string[]) => {
+      const reasons = (Array.isArray(reason) ? reason : [reason]).slice().sort();
+      runtime.wakes.push(reasons);
+      runtime.events.push('wake');
+      if (reasons.includes('manual')) await manualGate;
+      return { ran: true };
+    };
+    runtime.value.getConfig = () => ({ skillEvolutionReviewAttemptDeadlineMinutes: 0.0005 });
+
+    let releaseCount = 0;
+    const ownerLock = {
+      acquired: true as const,
+      generation: 'test-generation',
+      lockPath: path.join(root, 'owner.json'),
+      record: {
+        pid: process.pid,
+        startedAt: new Date().toISOString(),
+        generation: 'test-generation',
+        token: 'test-token',
+      },
+      assertOwnership: () => undefined,
+      touch: () => undefined,
+      release: () => { releaseCount += 1; },
+    };
+    const scheduler = new DistillationHeartbeatScheduler(root, runtime.value as any, ownerLock as any);
+    try {
+      await scheduler.start();
+      await waitFor(() => runtime.wakes.length >= 1);
+      runtime.wakes.length = 0;
+
+      const manualWake = scheduler.runHeartbeat('manual');
+      await waitFor(() => runtime.wakes.some(reasons => reasons.includes('manual')));
+      assert.equal(await scheduler.stop(), false);
+      await scheduler.start();
+
+      finishManual();
+      await manualWake;
+      await waitFor(() => runtime.wakes.some(reasons => reasons.includes('startup')));
+      await delay(25);
+      assert.equal(releaseCount, 0);
+    } finally {
+      finishManual();
+      await scheduler.stop();
+    }
   });
 
   test('keeps the owner lease until a timed-out runtime drain really settles', async () => {
