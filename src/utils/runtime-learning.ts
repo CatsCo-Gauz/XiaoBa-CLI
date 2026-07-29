@@ -2804,7 +2804,6 @@ export class RuntimeLearning {
       }
     }
 
-    let reviewedEpisodes = 0;
     let episodeReviewFailures = 0;
     let episodeReviewTimeouts = 0;
     let episodeOperationalFailures = 0;
@@ -2845,6 +2844,7 @@ export class RuntimeLearning {
     }
 
     type QueueResult = {
+      reviewedEpisodes: number;
       reviewed: number; deferredReviewed: number; operationalReviewed: number;
       operationalRetried: number; deferredRetried: number;
       transitionsByKind: Partial<Record<string, number>>;
@@ -2856,6 +2856,7 @@ export class RuntimeLearning {
       }>;
     };
     let queueResult: QueueResult = {
+      reviewedEpisodes: 0,
       reviewed: 0, deferredReviewed: 0, operationalReviewed: 0,
       operationalRetried: 0, deferredRetried: 0, transitionsByKind: {},
       queueOutcomes: {},
@@ -2906,7 +2907,7 @@ export class RuntimeLearning {
     return {
       status,
       ...(errorParts.length > 0 ? { errorMessage: errorParts.join('; ') } : {}),
-      reviewedEpisodes,
+      reviewedEpisodes: queueResult.reviewedEpisodes,
       reviewedQueueEntries: queueResult.reviewed,
       deferredQueueReviews: queueResult.deferredReviewed,
       operationalQueueReviews: queueResult.operationalReviewed,
