@@ -67,7 +67,7 @@ export interface HeartbeatSchedulerOwnerRecord {
 export interface HeartbeatSchedulerOwnerLockOptions {
   runtimeRoot: string;
   command?: string;
-  /** Injectable env for test determinism. Defaults to `process.env`. */
+  /** @deprecated runtimeRoot is already authoritative; retained for caller compatibility. */
   env?: NodeJS.ProcessEnv;
   leaseMs?: number;
   now?: () => Date;
@@ -109,26 +109,6 @@ interface ClaimerRecord {
   pid: number;
   startedAt: string;
   token: string;
-}
-
-// ---------------------------------------------------------------------------
-// Env-based runtime data root resolution
-// ---------------------------------------------------------------------------
-
-function resolveRuntimeDataRoot(
-  runtimeRoot: string,
-  env: NodeJS.ProcessEnv,
-): string {
-  for (const key of [
-    'XIAOBA_USER_DATA_DIR',
-    'CATSCO_USER_DATA_DIR',
-    'XIAOBA_ELECTRON_USER_DATA_DIR',
-    'XIAOBA_RUNTIME_ROOT',
-  ]) {
-    const value = env[key]?.trim();
-    if (value) return path.resolve(value);
-  }
-  return path.resolve(runtimeRoot);
 }
 
 // ---------------------------------------------------------------------------
@@ -235,8 +215,9 @@ function isProcessAlive(pid: number): boolean {
 export function acquireHeartbeatSchedulerOwnerLock(
   options: HeartbeatSchedulerOwnerLockOptions,
 ): HeartbeatSchedulerOwnerLockResult {
-  const env = options.env ?? process.env;
-  const runtimeDataRoot = resolveRuntimeDataRoot(options.runtimeRoot, env);
+  // The caller resolves configuration precedence exactly once. Re-reading
+  // process.env here could fork the lock root from the scheduler data root.
+  const runtimeDataRoot = path.resolve(options.runtimeRoot);
   const xiaobaDir = path.join(runtimeDataRoot, '.xiaoba');
   const lockDir = path.join(xiaobaDir, LOCK_DIR_NAME);
   const lockFile = path.join(lockDir, LOCK_FILE_NAME);
@@ -261,8 +242,10 @@ export function acquireHeartbeatSchedulerOwnerLock(
   };
   const claimerSerialized = `${JSON.stringify(claimerRecord, null, 2)}\n`;
   let renewalTimer: NodeJS.Timeout | null = null;
+  let released = false;
   const makeAcquired = (): HeartbeatSchedulerOwnerLock => {
     const renew = (): boolean => {
+      if (released) return false;
       const current = readOwnerRecord(lockFile);
       if (!current || current.token !== record.token || current.generation !== record.generation) return false;
       const renewed = { ...record, lastHeartbeatAt: now().toISOString() };
@@ -289,6 +272,8 @@ export function acquireHeartbeatSchedulerOwnerLock(
         if (!renew()) throw new Error(`Heartbeat scheduler owner fenced (generation=${record.generation})`);
       },
       release: () => {
+        if (released) return;
+        released = true;
         if (renewalTimer) { clearInterval(renewalTimer); renewalTimer = null; }
         releaseHeartbeatSchedulerOwnerLock(lockDir, record);
       },

@@ -78,6 +78,8 @@ export interface AgentServices {
   };
   toolManager: ToolManager;
   skillManager: SkillManager;
+  /** Authoritative runtime data root shared by session logs and background owners. */
+  runtimeDataRoot?: string;
 
 }
 
@@ -197,7 +199,7 @@ export class AgentSession {
     private readonly sessionRoute?: SessionRoute,
   ) {
     const type = sessionType || this.extractSessionType(key);
-    this.sessionTurnLogger = new SessionTurnLogger(type, key);
+    this.sessionTurnLogger = new SessionTurnLogger(type, key, services.runtimeDataRoot);
     this.turnLogRecorder = new TurnLogRecorder(this.sessionTurnLogger);
     const modelConfig = typeof (services.aiService as any).getConfig === 'function'
       ? (services.aiService as any).getConfig()

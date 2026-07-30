@@ -253,9 +253,8 @@ export async function startRuntimeCommandSupport(
         attemptHeartbeatOwnership = async (startImmediately: boolean): Promise<boolean> => {
           if (stopping || distillationHeartbeatScheduler || runtimeLearning) return false;
           const ownerLock = acquireHeartbeatSchedulerOwnerLock({
-            runtimeRoot: workingDirectory,
+            runtimeRoot: PathResolver.getRuntimeDataRoot(process.env, workingDirectory),
             command: process.argv.join(' '),
-            env: process.env,
           });
           if (ownerLock.acquired) {
             if (stopping) {
