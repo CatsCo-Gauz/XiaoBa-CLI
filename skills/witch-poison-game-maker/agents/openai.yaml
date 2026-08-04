@@ -1,0 +1,4 @@
+interface:
+  display_name: "女巫的毒药课堂游戏"
+  short_description: "将英语词表生成适合课堂大屏双组对战的离线认读小游戏"
+  default_prompt: "使用 $witch-poison-game-maker 把我提供的英语词汇生成女巫的毒药课堂认读游戏 HTML。"

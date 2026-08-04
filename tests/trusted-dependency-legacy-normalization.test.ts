@@ -17,7 +17,6 @@ import {
   findDeferredJobByBundleId,
 } from '../src/utils/evidence-review-job-store';
 import { createEvidenceReviewJob } from '../src/utils/evidence-review-graph';
-import { listRunnableQuanta } from '../src/utils/evidence-review-graph-core';
 import {
   advanceJobsFairly,
   readShardStructurally,
@@ -289,16 +288,7 @@ async function advanceFairUntilBlocked(runtime: SkillEvolutionRuntime) {
       { maxClaims: 1, maxClaimsPerJob: 1 },
     );
     for (const jobId of advanced.jobIds) touched.add(jobId);
-    if (advanced.claims === 0) {
-      const jobs = runtime.getEvidenceReviewEngine().loadStore().jobs;
-      const runnableSuccessors = Object.values(jobs).filter(job => (
-        job.disposition === 'active'
-        && !!job.parentJobId
-        && listRunnableQuanta(job).length > 0
-      ));
-      if (runnableSuccessors.length === 0) break;
-      for (const job of runnableSuccessors) touched.add(job.jobId);
-    }
+    if (advanced.claims === 0) break;
   }
   return runtime.collectFairReviewOutcomes([...touched]);
 }
@@ -518,10 +508,7 @@ describe('legacy referencedSkills normalization', () => {
       const result = await advanceFairUntilBlocked(new SkillEvolutionRuntime(env.options));
 
       assert.equal(result.reviewed, 1);
-      assert.ok(seenReferencedSkills.length >= 1);
-      assert.ok(seenReferencedSkills.every(names => (
-        names.length === 1 && names[0] === 'generated-helper-a'
-      )));
+      assert.deepEqual(seenReferencedSkills, [['generated-helper-a']]);
     } finally {
       env.cleanup();
     }
@@ -551,10 +538,7 @@ describe('legacy referencedSkills normalization', () => {
       const result = await advanceFairUntilBlocked(new SkillEvolutionRuntime(env.options));
 
       assert.equal(result.reviewed, 1);
-      assert.ok(seenReferencedSkills.length >= 1);
-      assert.ok(seenReferencedSkills.every(names => (
-        names.length === 1 && names[0] === 'generated-helper-a'
-      )));
+      assert.deepEqual(seenReferencedSkills, [['generated-helper-a']]);
     } finally {
       env.cleanup();
     }

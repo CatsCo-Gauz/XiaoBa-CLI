@@ -37,7 +37,6 @@ export function buildSubAgentStatusMessage(
         sections: sections.join('\n\n'),
       }),
     ].join('\n\n'),
-    __cacheScope: 'dynamic',
   };
 }
 

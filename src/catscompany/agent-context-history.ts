@@ -3,13 +3,6 @@ import type { CatsAgentContextMessage } from './client';
 
 type UnknownRecord = Record<string, unknown>;
 
-export interface NativeFeishuGroupContextEntry {
-  source: 'catscompany.agent_context';
-  id: number;
-  role: 'user' | 'assistant';
-  content: string;
-}
-
 export function isNativeFeishuGroupTrigger(
   msg: Pick<ParsedCatsMessage, 'chatType' | 'metadata' | 'seq'>,
 ): boolean {
@@ -21,66 +14,34 @@ export function isNativeFeishuGroupTrigger(
 }
 
 /**
- * Returns durable group participant messages since the previous model turn.
- * Mentions control activation only; every eligible human or other-Agent message
- * remains replayable context. The exact current trigger is excluded by sequence
- * so earlier messages that also targeted this Agent are not accidentally lost.
+ * Returns durable Feishu group messages since the previous model trigger.
+ * The server removes tool/runtime noise; every eligible participant message,
+ * including other Agents and messages mentioning someone else, remains context.
+ * This client-side pass only keeps replay bounded and idempotent.
  */
 export function selectNativeFeishuGroupContext(
   history: CatsAgentContextMessage[],
   afterSeq = 0,
-  currentTriggerSeq = 0,
 ): string[] {
-  return selectNativeFeishuGroupContextEntries(history, afterSeq, currentTriggerSeq)
-    .map(entry => entry.content);
-}
-
-export function selectNativeFeishuGroupContextEntries(
-  history: CatsAgentContextMessage[],
-  afterSeq = 0,
-  currentTriggerSeq = 0,
-): NativeFeishuGroupContextEntry[] {
   const ordered = [...history].sort((a, b) => agentContextMessageSeq(a) - agentContextMessageSeq(b));
   const clearBoundarySeq = ordered.reduce((latest, message) => (
     isNativeFeishuClearBoundary(message) ? Math.max(latest, agentContextMessageSeq(message)) : latest
   ), 0);
   const effectiveAfterSeq = Math.max(afterSeq, clearBoundarySeq);
   return ordered
-    .filter(message => {
-      const seq = agentContextMessageSeq(message);
-      return seq > effectiveAfterSeq && (currentTriggerSeq <= 0 || seq !== currentTriggerSeq);
-    })
-    .map(message => {
-      const role = normalizedContextRole(message);
-      return {
-        source: 'catscompany.agent_context' as const,
-        id: agentContextMessageSeq(message),
-        role,
-        content: role === 'assistant'
-          ? extractMessageText(message)
-          : formatParticipantMessage(message),
-      };
-    })
-    .filter((entry): entry is NativeFeishuGroupContextEntry => Boolean(entry.role))
-    .filter(entry => entry.id > 0 && Boolean(entry.content));
+    .filter(message => agentContextMessageSeq(message) > effectiveAfterSeq)
+    .filter(message => isEligibleParticipantMessage(message))
+    .map(formatParticipantMessage)
+    .filter((message): message is string => Boolean(message));
 }
 
-function normalizedContextRole(
-  message: CatsAgentContextMessage,
-): 'user' | 'assistant' | undefined {
-  if (
-    message.context_role === 'other_agent'
-    && message.context_reason === 'other_agent_message'
-  ) {
-    return 'user';
-  }
-  if (
-    message.context_eligible === true
-    && (message.context_role === 'user' || message.context_role === 'assistant')
-  ) {
-    return message.context_role;
-  }
-  return undefined;
+function isEligibleParticipantMessage(message: CatsAgentContextMessage): boolean {
+  return message.context_eligible === true
+    && message.context_role === 'user'
+    // The trigger that already opened this Agent turn is stored separately;
+    // replaying it would duplicate the current root input. Other @ messages
+    // and other Agents' replies remain ordinary group context.
+    && message.context_reason !== 'group_message_targets_agent';
 }
 
 export function isNativeFeishuClearBoundary(message: CatsAgentContextMessage): boolean {

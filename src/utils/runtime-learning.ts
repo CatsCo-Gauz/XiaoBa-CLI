@@ -2765,7 +2765,6 @@ export class RuntimeLearning {
               maxClaimsPerJob: 1,
               signal: wakeSignal,
               now: this.clock(),
-              quantumTimeoutMs: this.config.skillEvolutionReviewAttemptDeadlineMinutes * 60_000,
               shouldStopClaiming: () => this.shutdownDrainRequested,
             },
           );
@@ -2804,6 +2803,7 @@ export class RuntimeLearning {
       }
     }
 
+    let reviewedEpisodes = 0;
     let episodeReviewFailures = 0;
     let episodeReviewTimeouts = 0;
     let episodeOperationalFailures = 0;
@@ -2829,22 +2829,35 @@ export class RuntimeLearning {
       }
     }
 
-    // Local work follows the same durable admission contract as external work.
-    // Newly admitted jobs are not drained synchronously; fair background wakes
-    // claim one Quantum per job and resume from the persisted graph.
-    for (const { episode, bundle } of localEpisodeTasks) {
-      try {
-        this.skillEvolution.enqueueReview(bundle);
-        pendingEpisodeIds.delete(episode.episodeId);
-      } catch (error) {
-        episodeReviewFailures++;
-        settlementError = settlementError ?? error;
-        Logger.warning(`[RuntimeLearning] review admission failed for ${episode.episodeId}: ${toErrorMessage(error)}`);
-      }
+    // Preserve the established one-wake behavior for local delivery episodes,
+    // whose callers and tests rely on an immediate transition result.
+    try {
+      await mapWithConcurrency(
+        localEpisodeTasks,
+        Math.max(1, Math.floor(this.config.skillEvolutionReviewerConcurrency)),
+        async ({ episode, bundle }) => {
+          try {
+            const result = await this.skillEvolution.reviewAndApply(bundle, wakeSignal);
+            if (result.queued === 'operational') {
+              const queued = this.skillEvolution.getQueuedReviewState(bundle.bundleId);
+              if (queued?.failureKind === 'branch_timeout') episodeReviewTimeouts++;
+              else episodeOperationalFailures++;
+            }
+            this.linkEvidenceCapsuleToAudit(bundle.bundleId, result.audit?.transitionId ?? result.transitionId);
+            incrementTransition(transitionsByKind, result.transition);
+            reviewedEpisodes++;
+            pendingEpisodeIds.delete(episode.episodeId);
+          } catch (error: any) {
+            episodeReviewFailures++;
+            Logger.warning(`[RuntimeLearning] review failed for ${episode.episodeId}: ${error.message}`);
+          }
+        },
+      );
+    } catch (error) {
+      settlementError = settlementError ?? error;
     }
 
     type QueueResult = {
-      reviewedEpisodes: number;
       reviewed: number; deferredReviewed: number; operationalReviewed: number;
       operationalRetried: number; deferredRetried: number;
       transitionsByKind: Partial<Record<string, number>>;
@@ -2856,7 +2869,6 @@ export class RuntimeLearning {
       }>;
     };
     let queueResult: QueueResult = {
-      reviewedEpisodes: 0,
       reviewed: 0, deferredReviewed: 0, operationalReviewed: 0,
       operationalRetried: 0, deferredRetried: 0, transitionsByKind: {},
       queueOutcomes: {},
@@ -2907,7 +2919,7 @@ export class RuntimeLearning {
     return {
       status,
       ...(errorParts.length > 0 ? { errorMessage: errorParts.join('; ') } : {}),
-      reviewedEpisodes: queueResult.reviewedEpisodes,
+      reviewedEpisodes,
       reviewedQueueEntries: queueResult.reviewed,
       deferredQueueReviews: queueResult.deferredReviewed,
       operationalQueueReviews: queueResult.operationalReviewed,

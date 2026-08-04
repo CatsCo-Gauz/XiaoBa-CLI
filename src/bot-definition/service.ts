@@ -2,7 +2,6 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as dotenv from 'dotenv';
-import { canonicalizeBotSkillRefs } from '../bot-skills/canonical';
 import { createCatsCoLocalConfigService } from '../catscompany/local-config';
 import { normalizeOpenAIApiMode } from '../utils/openai-api-mode';
 import { normalizeReasoningEffort } from '../utils/reasoning-effort';
@@ -18,7 +17,6 @@ import {
   type BotCatalogModelRuntime,
   type BotDefinition,
   type BotDefinitionSyncResult,
-  type BotSkillRef,
   type BotModelDefinition,
   type BotPromptDefinition,
   type CustomBotModelDefinition,
@@ -303,20 +301,18 @@ function normalizeBotModelDefinition(model: BotModelDefinition): BotModelDefinit
 function normalizeBotDefinition(definition: BotDefinition): BotDefinition {
   const model = normalizeBotModelDefinition(definition.model);
   const prompt = definition.prompt && normalizePromptDefinition(definition.prompt);
-  const skills = definition.skills === undefined ? undefined : canonicalizeBotSkillRefs(definition.skills);
-  const skillsChanged = skills !== undefined && JSON.stringify(skills) !== JSON.stringify(definition.skills);
-  return model === definition.model && prompt === definition.prompt && !skillsChanged
+  return model === definition.model && prompt === definition.prompt
     ? definition
-    : {
-        ...definition,
-        model,
-        ...(prompt ? { prompt } : {}),
-        ...(skills !== undefined ? { skills } : {}),
-      };
+    : { ...definition, model, ...(prompt ? { prompt } : {}) };
 }
 
 function normalizePromptDefinition(prompt: BotPromptDefinition): BotPromptDefinition {
-  return prompt;
+  const customSystemPrompt = prompt.customSystemPrompt?.trim();
+  if (customSystemPrompt === prompt.customSystemPrompt) return prompt;
+  return {
+    selected: prompt.selected,
+    ...(customSystemPrompt ? { customSystemPrompt } : {}),
+  };
 }
 
 function normalizeCatalogRuntime(runtime: BotCatalogModelRuntime): BotCatalogModelRuntime {
@@ -326,8 +322,8 @@ function normalizeCatalogRuntime(runtime: BotCatalogModelRuntime): BotCatalogMod
     ...runtime,
     modelId: profile.id,
     model: profile.model,
-    contextWindowTokens: runtime.contextWindowTokens || profile.contextWindowTokens,
-    capabilities: runtime.capabilities ?? profile.capabilities,
+    contextWindowTokens: profile.contextWindowTokens,
+    capabilities: profile.capabilities,
   };
 }
 
@@ -405,6 +401,7 @@ export class BotDefinitionSyncService {
         if (previousCache?.model.kind === 'custom') {
           this.storeCustomModelProfile(botId, previousCache.model);
         }
+        if (definition !== rawDefinition) this.repository.writeCanonical(definition);
         this.repository.writeCache(definition);
         if (definition.model.kind === 'custom') {
           this.storeCustomModelProfile(definition.botId, definition.model);
@@ -435,11 +432,12 @@ export class BotDefinitionSyncService {
         botId,
         model: normalizedModel,
       };
+      this.repository.writeCanonical(definition);
       this.repository.writeCache(definition);
       this.clearLegacyModelConfigurationWhenReady(definition);
       return {
         botId,
-        direction: 'local_cache_update',
+        direction: 'local_to_simulated_cloud',
         definition,
       };
     });
@@ -462,61 +460,13 @@ export class BotDefinitionSyncService {
         prompt: normalizePromptDefinition(prompt),
       };
       this.repository.writeCache(definition);
+      this.repository.writeCanonical(definition);
       return {
         botId,
-        direction: 'local_cache_update',
+        direction: 'local_to_simulated_cloud',
         definition,
       };
     });
-  }
-
-  /**
-   * Accepts the canonical cloud snapshot as the only runnable local cache.
-   * The old simulated canonical file is intentionally not rewritten.
-   */
-  acceptCanonical(definition: BotDefinition): BotDefinitionSyncResult {
-    return this.withDefinitionWriteLock(definition.botId, () => {
-      const normalized = normalizeBotDefinition(definition);
-      const previous = this.repository.readCache(normalized.botId);
-      if (previous?.model.kind === 'custom') {
-        this.storeCustomModelProfile(normalized.botId, previous.model);
-      }
-      this.repository.writeCache(normalized);
-      if (normalized.model.kind === 'custom') {
-        this.storeCustomModelProfile(normalized.botId, normalized.model);
-      }
-      return {
-        botId: normalized.botId,
-        direction: 'cloud_to_local',
-        definition: normalized,
-      };
-    });
-  }
-
-  updateSkills(botId: string, skills: readonly BotSkillRef[]): BotDefinitionSyncResult {
-    return this.withDefinitionWriteLock(botId, () => {
-      const previous = this.repository.readCache(botId) ?? this.repository.readCanonical(botId);
-      if (!previous) {
-        throw new Error(`BotDefinition does not exist for bot ${botId}`);
-      }
-      const definition: BotDefinition = {
-        ...previous,
-        schema: BOT_DEFINITION_SCHEMA,
-        botId,
-        skills: canonicalizeBotSkillRefs(skills),
-      };
-      this.repository.writeCache(definition);
-      return {
-        botId,
-        direction: 'local_cache_update',
-        definition,
-      };
-    });
-  }
-
-  readLegacyCanonical(botId: string): BotDefinition | undefined {
-    const definition = this.repository.readCanonical(botId);
-    return definition ? normalizeBotDefinition(definition) : undefined;
   }
 
   acceptCloud(botId: string, model: BotModelDefinition): BotDefinitionSyncResult {
@@ -595,27 +545,15 @@ export class BotDefinitionSyncService {
   }
 
   pullOrBootstrap(botId: string): BotDefinitionSyncResult | undefined {
-    const cached = this.repository.readCache(botId);
-    if (cached) {
-      const existing = normalizeBotDefinition(cached);
+    const existing = this.pull(botId);
+    if (existing) {
       this.migrateLegacyCustomModelProfile(existing.botId);
       this.migrateLegacyCatalogRuntime(existing);
       this.clearLegacyModelConfigurationWhenReady(existing);
       return {
         botId,
-        direction: 'local_cache_update',
+        direction: 'simulated_cloud_to_local',
         definition: existing,
-      };
-    }
-    const legacyCanonical = this.pull(botId);
-    if (legacyCanonical) {
-      this.migrateLegacyCustomModelProfile(legacyCanonical.botId);
-      this.migrateLegacyCatalogRuntime(legacyCanonical);
-      this.clearLegacyModelConfigurationWhenReady(legacyCanonical);
-      return {
-        botId,
-        direction: 'legacy_simulated_cloud_to_local',
-        definition: legacyCanonical,
       };
     }
     const profile = readLegacyLocalModelProfile(this.runtimeRoot, this.env);
@@ -629,7 +567,7 @@ export class BotDefinitionSyncService {
     this.clearLegacyModelConfigurationWhenReady(definition);
     return {
       botId,
-      direction: 'legacy_bootstrap_to_local',
+      direction: 'bootstrap_to_simulated_cloud',
       definition,
     };
   }

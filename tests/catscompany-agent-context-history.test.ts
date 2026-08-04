@@ -3,7 +3,6 @@ import * as assert from 'node:assert';
 import {
   isNativeFeishuGroupTrigger,
   selectNativeFeishuGroupContext,
-  selectNativeFeishuGroupContextEntries,
 } from '../src/catscompany/agent-context-history';
 import { CatsCompanyBot } from '../src/catscompany';
 
@@ -89,6 +88,22 @@ describe('CatsCompany native Feishu group context', () => {
       },
       {
         seq_id: 6,
+        content: '@Wanyu 请先检查数据',
+        context_eligible: true,
+        context_role: 'user',
+        context_reason: 'participant_message',
+        metadata: { catsco_identity: nativeMetadata({ speaker: '布鲁斯' }).catsco_identity },
+      },
+      {
+        seq_id: 7,
+        content: '数据检查完成',
+        context_eligible: true,
+        context_role: 'user',
+        context_reason: 'other_agent_message',
+        metadata: { catsco_identity: nativeMetadata({ speaker: 'Wanyu' }).catsco_identity },
+      },
+      {
+        seq_id: 8,
         content: 'working...',
         context_eligible: false,
         context_role: 'assistant',
@@ -108,81 +123,25 @@ describe('CatsCompany native Feishu group context', () => {
     assert.deepEqual(context, [
       '[发言人: 陈大为]\n给我发一个 txt 文件',
       '[发言人: 林益]\n里面写一句诗',
+      '[发言人: 布鲁斯]\n@Wanyu 请先检查数据',
+      '[发言人: Wanyu]\n数据检查完成',
     ]);
   });
 
-  test('keeps a missed current-Agent message as assistant during incremental hydration', () => {
-    const context = selectNativeFeishuGroupContextEntries([
-      {
-        seq_id: 11,
-        content: '上一轮由当前 Agent 发出的回复',
-        context_eligible: true,
-        context_role: 'assistant',
-        context_reason: 'current_agent_message',
-      },
-      {
-        seq_id: 12,
-        content: '@当前Agent 继续',
-        context_eligible: true,
-        context_role: 'user',
-        context_reason: 'group_message_targets_agent',
-        metadata: { catsco_identity: nativeMetadata({ speaker: '陈大为' }).catsco_identity },
-      },
-    ], 10, 12);
+  test('does not replay an earlier message that already triggered the agent', () => {
+    const context = selectNativeFeishuGroupContext([{
+      id: 7,
+      seq_id: 7,
+      content: '@机器人 总结上面的讨论',
+      context_eligible: true,
+      context_role: 'user',
+      context_reason: 'group_message_targets_agent',
+      agent_uid: 42,
+      agent_id: 'usr42',
+      metadata: nativeMetadata({ triggered: true }),
+    }], 0);
 
-    assert.deepEqual(context, [{
-      source: 'catscompany.agent_context',
-      id: 11,
-      role: 'assistant',
-      content: '上一轮由当前 Agent 发出的回复',
-    }]);
-  });
-
-  test('excludes only the exact current trigger and keeps earlier targeted turns', () => {
-    const context = selectNativeFeishuGroupContext([
-      {
-        id: 7,
-        seq_id: 7,
-        content: '@机器人 上一轮已经问过的问题',
-        context_eligible: true,
-        context_role: 'user',
-        context_reason: 'group_message_targets_agent',
-        agent_uid: 42,
-        agent_id: 'usr42',
-        metadata: nativeMetadata({ triggered: true, speaker: '布鲁斯' }),
-      },
-      {
-        id: 8,
-        seq_id: 8,
-        content: '@机器人 当前触发',
-        context_eligible: true,
-        context_role: 'user',
-        context_reason: 'group_message_targets_agent',
-        agent_uid: 42,
-        agent_id: 'usr42',
-        metadata: nativeMetadata({ triggered: true, speaker: '布鲁斯' }),
-      },
-    ], 0, 8);
-
-    assert.deepEqual(context, ['[发言人: 布鲁斯]\n@机器人 上一轮已经问过的问题']);
-  });
-
-  test('replays legacy other_agent context as a labeled participant', () => {
-    const context = selectNativeFeishuGroupContext([
-      {
-        id: 21,
-        seq_id: 21,
-        content: '旧版其他 Agent 的结论',
-        context_eligible: false,
-        context_role: 'other_agent',
-        context_reason: 'other_agent_message',
-        agent_uid: 42,
-        agent_id: 'usr42',
-        metadata: { catsco_identity: nativeMetadata({ speaker: 'Saturday' }).catsco_identity },
-      },
-    ]);
-
-    assert.deepEqual(context, ['[发言人: Saturday]\n旧版其他 Agent 的结论']);
+    assert.deepEqual(context, []);
   });
 
   test('keeps only ordinary group messages after the latest clear boundary', () => {
@@ -223,7 +182,7 @@ describe('CatsCompany native Feishu group context', () => {
     assert.deepEqual(context, ['[发言人: 林益]\n清空后的新讨论']);
   });
 
-  test('hydrates complete missed group history before processing the current trigger', async () => {
+  test('injects restored ordinary messages before processing the trigger turn', async () => {
     const bot = Object.create(CatsCompanyBot.prototype) as any;
     bot.botUid = 'usr42';
     const injected: string[] = [];
@@ -233,63 +192,17 @@ describe('CatsCompany native Feishu group context', () => {
         assert.equal(topic, 'grp_9');
         assert.equal(options.beforeId, 88);
         return {
-          messages: [
-            {
-              id: 84,
-              seq_id: 84,
-              content: '公网能访问么',
-              context_eligible: true,
-              context_role: 'user',
-              context_reason: 'participant_message',
-              agent_uid: 42,
-              agent_id: 'usr42',
-              metadata: { catsco_identity: nativeMetadata({ speaker: '布鲁斯' }).catsco_identity },
-            },
-            {
-              id: 85,
-              seq_id: 85,
-              content: '@另一个Agent 先检查部署',
-              context_eligible: true,
-              context_role: 'user',
-              context_reason: 'group_message_targets_another_member',
-              agent_uid: 42,
-              agent_id: 'usr42',
-              metadata: { catsco_identity: nativeMetadata({ speaker: '布鲁斯' }).catsco_identity },
-            },
-            {
-              id: 86,
-              seq_id: 86,
-              content: '部署正常，公网入口未开放',
-              context_eligible: true,
-              context_role: 'user',
-              context_reason: 'other_agent_message',
-              agent_uid: 42,
-              agent_id: 'usr42',
-              metadata: { catsco_identity: nativeMetadata({ speaker: 'Saturday' }).catsco_identity },
-            },
-            {
-              id: 87,
-              seq_id: 87,
-              content: '@所有人 汇总',
-              context_eligible: true,
-              context_role: 'user',
-              context_reason: 'group_message_targets_all_agents',
-              agent_uid: 42,
-              agent_id: 'usr42',
-              metadata: { catsco_identity: nativeMetadata({ speaker: '布鲁斯' }).catsco_identity },
-            },
-            {
-              id: 88,
-              seq_id: 88,
-              content: '@当前Agent',
-              context_eligible: true,
-              context_role: 'user',
-              context_reason: 'group_message_targets_agent',
-              agent_uid: 42,
-              agent_id: 'usr42',
-              metadata: { catsco_identity: nativeMetadata({ speaker: '布鲁斯' }).catsco_identity },
-            },
-          ],
+          messages: [{
+            id: 87,
+            seq_id: 87,
+            content: '回答我上面的问题',
+            context_eligible: true,
+            context_role: 'user',
+            context_reason: 'participant_message',
+            agent_uid: 42,
+            agent_id: 'usr42',
+            metadata: { catsco_identity: nativeMetadata({ speaker: '林益' }).catsco_identity },
+          }],
           topic_id: 'grp_9',
           agent_uid: 42,
           has_more: false,
@@ -299,9 +212,9 @@ describe('CatsCompany native Feishu group context', () => {
     };
 
     await bot.hydrateNativeFeishuGroupContext({
-      appendDurableContext: async (messages: Array<string | { content: string }>, cursorUpdate?: { source: string; cursor: number }) => { injected.push(...messages.map(message => typeof message === 'string' ? message : message.content)); if (cursorUpdate) savedCursors.push([cursorUpdate.source, cursorUpdate.cursor]); return true; },
+      injectContext: (message: string) => injected.push(message),
       getRemoteContextCursor: () => 80,
-      saveRemoteContextCursor: (source: string, cursor: number) => { savedCursors.push([source, cursor]); return true; },
+      saveRemoteContextCursor: (source: string, cursor: number) => savedCursors.push([source, cursor]),
     }, {
       message: {
         topic: 'grp_9',
@@ -312,55 +225,8 @@ describe('CatsCompany native Feishu group context', () => {
       clearGeneration: 0,
     }, 'cc_group:grp_9');
 
-    assert.deepEqual(injected, [
-      '[发言人: 布鲁斯]\n公网能访问么',
-      '[发言人: 布鲁斯]\n@另一个Agent 先检查部署',
-      '[发言人: Saturday]\n部署正常，公网入口未开放',
-      '[发言人: 布鲁斯]\n@所有人 汇总',
-    ]);
+    assert.deepEqual(injected, ['[发言人: 林益]\n回答我上面的问题']);
     assert.deepEqual(savedCursors, [['catscompany.agent_context', 88]]);
-  });
-
-  test('does not advance the remote cursor when durable context persistence fails', async () => {
-    const bot = Object.create(CatsCompanyBot.prototype) as any;
-    bot.botUid = 'usr42';
-    bot.bot = {
-      getAgentContextHistory: async () => ({
-        messages: [{
-          id: 81,
-          seq_id: 81,
-          content: '需要保留的补历史消息',
-          context_eligible: true,
-          context_role: 'user',
-          context_reason: 'participant_message',
-          agent_uid: 42,
-          agent_id: 'usr42',
-          metadata: { catsco_identity: nativeMetadata({ speaker: '布鲁斯' }).catsco_identity },
-        }],
-        topic_id: 'grp_9',
-        agent_uid: 42,
-        has_more: false,
-        next_before_id: 0,
-      }),
-    };
-    const savedCursors: number[] = [];
-
-    const valid = await bot.hydrateNativeFeishuGroupContext({
-      appendDurableContext: async () => false,
-      getRemoteContextCursor: () => 80,
-      saveRemoteContextCursor: (_source: string, cursor: number) => { savedCursors.push(cursor); return true; },
-    }, {
-      message: {
-        topic: 'grp_9',
-        chatType: 'group',
-        seq: 82,
-        metadata: nativeMetadata({ triggered: true }),
-      },
-      clearGeneration: 0,
-    }, 'cc_group:grp_9');
-
-    assert.equal(valid, false);
-    assert.deepEqual(savedCursors, []);
   });
 
   test('does not inject history twice after a complete cloud restore', async () => {
@@ -375,9 +241,9 @@ describe('CatsCompany native Feishu group context', () => {
     };
 
     await bot.hydrateNativeFeishuGroupContext({
-      appendDurableContext: async () => assert.fail('restored history must not be appended twice'),
+      injectContext: () => assert.fail('restored history must not be injected twice'),
       getRemoteContextCursor: () => 100,
-      saveRemoteContextCursor: (source: string, cursor: number) => { savedCursors.push([source, cursor]); return true; },
+      saveRemoteContextCursor: (source: string, cursor: number) => savedCursors.push([source, cursor]),
     }, {
       message: {
         topic: 'grp_9',
@@ -433,9 +299,9 @@ describe('CatsCompany native Feishu group context', () => {
     };
 
     const valid = await bot.hydrateNativeFeishuGroupContext({
-      appendDurableContext: async (messages: Array<string | { content: string }>, cursorUpdate?: { cursor: number }) => { injected.push(...messages.map(message => typeof message === 'string' ? message : message.content)); if (cursorUpdate) savedCursor = cursorUpdate.cursor; return true; },
+      injectContext: (message: string) => injected.push(message),
       getRemoteContextCursor: () => savedCursor,
-      saveRemoteContextCursor: (_source: string, cursor: number) => { savedCursor = cursor; return true; },
+      saveRemoteContextCursor: (_source: string, cursor: number) => { savedCursor = cursor; },
     }, {
       message: {
         topic: 'grp_9',
@@ -454,7 +320,7 @@ describe('CatsCompany native Feishu group context', () => {
     assert.equal(savedCursor, 205);
   });
 
-  test('paginates beyond ten pages without losing older durable history', async () => {
+  test('uses a bounded recent-history fallback and advances the cursor for very large gaps', async () => {
     const bot = Object.create(CatsCompanyBot.prototype) as any;
     bot.botUid = 'usr42';
     const injected: string[] = [];
@@ -485,9 +351,9 @@ describe('CatsCompany native Feishu group context', () => {
     };
 
     const valid = await bot.hydrateNativeFeishuGroupContext({
-      appendDurableContext: async (messages: Array<string | { content: string }>, cursorUpdate?: { cursor: number }) => { injected.push(...messages.map(message => typeof message === 'string' ? message : message.content)); if (cursorUpdate) savedCursor = cursorUpdate.cursor; return true; },
+      injectContext: (message: string) => injected.push(message),
       getRemoteContextCursor: () => savedCursor,
-      saveRemoteContextCursor: (_source: string, cursor: number) => { savedCursor = cursor; return true; },
+      saveRemoteContextCursor: (_source: string, cursor: number) => { savedCursor = cursor; },
     }, {
       message: {
         topic: 'grp_9',
@@ -499,7 +365,7 @@ describe('CatsCompany native Feishu group context', () => {
     }, 'cc_group:grp_9');
 
     assert.equal(valid, true);
-    assert.equal(fetches, 11);
+    assert.equal(fetches, 10);
     assert.equal(injected.length, 1000);
     assert.equal(savedCursor, 1001);
   });
@@ -533,9 +399,9 @@ describe('CatsCompany native Feishu group context', () => {
       const savedCursors: number[] = [];
 
       const valid = await bot.hydrateNativeFeishuGroupContext({
-        appendDurableContext: async (messages: Array<string | { content: string }>) => { injected.push(...messages.map(message => typeof message === 'string' ? message : message.content)); return true; },
+        injectContext: (message: string) => injected.push(message),
         getRemoteContextCursor: () => 80,
-        saveRemoteContextCursor: (_source: string, cursor: number) => { savedCursors.push(cursor); return true; },
+        saveRemoteContextCursor: (_source: string, cursor: number) => savedCursors.push(cursor),
       }, {
         message: {
           topic: 'grp_9',
@@ -546,7 +412,7 @@ describe('CatsCompany native Feishu group context', () => {
         clearGeneration: 0,
       }, 'cc_group:grp_9');
 
-      assert.equal(valid, false);
+      assert.equal(valid, true);
       assert.deepEqual(injected, []);
       assert.deepEqual(savedCursors, []);
     }

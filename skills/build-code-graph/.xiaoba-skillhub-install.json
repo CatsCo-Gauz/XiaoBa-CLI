@@ -1,0 +1,17 @@
+{
+  "source": "skillhub",
+  "userId": "user_6ad0bbc312044e369abc3f8516e071f8",
+  "skillId": "lin/build-code-graph",
+  "name": "build-code-graph",
+  "installName": "build-code-graph",
+  "version": "1.0.0",
+  "packageChecksumSha256": "6d4b8c13429b829ad73c3d242973e59f30c34d7fa1cb3ffe863de696a0e95b2e",
+  "signature": {
+    "keyId": "catsco-skillhub-prod-2026-01",
+    "signedAt": "2026-07-24T02:31:45.329Z",
+    "algorithm": "ed25519",
+    "signature": "YjRf+4eFGhiYkJaKwPXz4BbnXIvyPBCYUDE/oPhCQs+PJfUOk0VES3NoO225nW3PSuaN2ofy0HIyffKdFCdvDg=="
+  },
+  "packageUrl": "https://logs.catsco.fun:9000/packages/lin/build-code-graph/1.0.0/build-code-graph-1.0.0-6d4b8c13429b.skillpkg",
+  "installedAt": "2026-07-24T02:38:22.205Z"
+}

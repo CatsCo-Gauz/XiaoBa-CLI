@@ -1703,7 +1703,6 @@ describe('subagent runtime events', () => {
   test('subagent runner uses maxTurns only when the main agent specifies it', async () => {
     const observedMaxTurns: Array<number | undefined> = [];
     const originalRun = ConversationRunner.prototype.run;
-    const workingDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-subagent-max-turns-'));
     (ConversationRunner.prototype as any).run = async function runMock() {
       observedMaxTurns.push((this as any).maxTurns);
       return {
@@ -1719,7 +1718,7 @@ describe('subagent runtime events', () => {
         agentType: 'explorer',
         taskDescription: 'bounded',
         userMessage: 'bounded',
-        workingDirectory,
+        workingDirectory: process.cwd(),
         maxTurns: 7,
       });
       await bounded.run();
@@ -1728,21 +1727,19 @@ describe('subagent runtime events', () => {
         agentType: 'explorer',
         taskDescription: 'unbounded',
         userMessage: 'unbounded',
-        workingDirectory,
+        workingDirectory: process.cwd(),
       });
       await unbounded.run();
 
       assert.deepEqual(observedMaxTurns, [7, undefined]);
     } finally {
       ConversationRunner.prototype.run = originalRun;
-      fs.rmSync(workingDirectory, { recursive: true, force: true });
     }
   });
 
   test('subagent runner inherits delegated tool authorization context', async () => {
     let observedContext: any;
     const originalRun = ConversationRunner.prototype.run;
-    const workingDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'xiaoba-subagent-delegated-'));
     (ConversationRunner.prototype as any).run = async function runMock() {
       observedContext = (this as any).toolExecutionContext;
       return {
@@ -1775,7 +1772,7 @@ describe('subagent runtime events', () => {
       const session = new SubAgentSession('sub-delegated-context', {} as any, {} as any, {
         taskDescription: 'delegated context',
         userMessage: 'delegated context',
-        workingDirectory,
+        workingDirectory: process.cwd(),
         delegatedToolContext: {
           surface: 'catscompany',
           executionScope: executionScope as any,
@@ -1796,7 +1793,6 @@ describe('subagent runtime events', () => {
       assert.equal(typeof observedContext.requestParentInput, 'function');
     } finally {
       ConversationRunner.prototype.run = originalRun;
-      fs.rmSync(workingDirectory, { recursive: true, force: true });
     }
   });
 

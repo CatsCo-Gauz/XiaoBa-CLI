@@ -1,6 +1,6 @@
 {
   "name": "xiaoba-cli",
-  "version": "1.4.7",
+  "version": "1.4.6",
   "description": "CatsCo - local agent runtime and dashboard",
   "main": "electron/main.js",
   "bin": {
@@ -12,6 +12,8 @@
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
     "start:cli": "node dist/index.js",
+    "review:runtime": "tsx src/review/review-adapter-cli.ts",
+    "inspection:runtime": "tsx src/inspection/inspection-run-cli.ts",
     "electron:dev": "npm run build && node scripts/start-electron-dev.mjs",
     "electron:build": "npm run build && npm run prepare:runtime && npm run prune:electron-optionals && electron-builder --config electron-builder.config.cjs --publish never",
     "electron:build:mac": "npm run build && npm run prepare:runtime && npm run prune:electron-optionals && electron-builder --config electron-builder.config.cjs --mac --publish never",
@@ -20,11 +22,9 @@
     "watch": "tsc --watch",
     "test": "node scripts/run-tests.mjs runtime",
     "test:runtime": "node scripts/run-tests.mjs runtime",
-    "test:cross-repo:catsco-skills": "node scripts/cross-repo-catsco-skills-smoke.mjs",
     "test:legacy": "node scripts/run-tests.mjs legacy",
     "test:all": "node scripts/run-tests.mjs all",
     "test:list": "node scripts/run-tests.mjs runtime --list",
-    "canary:anthropic-prompt-cache": "node scripts/anthropic-prompt-cache-canary.mjs",
     "report": "node dist/index.js chat --exec '/report'",
     "clean-logs": "node scripts/clean-logs.mjs",
     "prepare:runtime": "node scripts/prepare-runtime.mjs",
@@ -74,6 +74,7 @@
     "ora": "^5.4.1",
     "pdf-parse": "^1.1.1",
     "pdfjs-dist": "^4.6.82",
+    "proper-lockfile": "^4.1.2",
     "sharp": "^0.34.5"
   },
   "devDependencies": {
@@ -160,11 +161,7 @@
         "zip"
       ],
       "icon": "build-resources/icons/icon.icns",
-      "artifactName": "${productName}-${version}-mac-${arch}.${ext}",
-      "hardenedRuntime": true,
-      "gatekeeperAssess": false,
-      "entitlements": "build-resources/entitlements.mac.plist",
-      "entitlementsInherit": "build-resources/entitlements.mac.inherit.plist"
+      "artifactName": "${productName}-${version}-mac-${arch}.${ext}"
     },
     "win": {
       "target": [

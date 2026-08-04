@@ -8,7 +8,7 @@ import { ContentBlock } from '../types';
 import { isReadPathAllowed } from '../utils/safety';
 import { createImageBlock } from '../utils/image-utils';
 import { ConfigManager } from '../utils/config';
-import { resolvePrimaryModelVisionCapability } from '../utils/model-capabilities';
+import { isPrimaryModelVisionCapable } from '../utils/model-capabilities';
 import { analyzeImageWithReaderProxy, ReaderProxyResult } from '../utils/reader-proxy';
 import { analyzeImageWithVisionFallback } from '../utils/vision-fallback-provider';
 import { Logger } from '../utils/logger';
@@ -778,14 +778,13 @@ export class ReadTool implements Tool {
     try {
       const renderedPages = await this.renderPdfPagesToImages(absolutePath, pages, tempDir);
       const isSupplement = options?.reason === 'visual_supplement';
-      const visionState = await resolvePrimaryModelVisionCapability(ConfigManager.getConfigReadonly());
-      const visionCapable = visionState === 'supported';
+      const visionCapable = isPrimaryModelVisionCapable(ConfigManager.getConfigReadonly());
       const parts = [
         isSupplement
           ? 'PDF 文本层已提取；由于用户任务可能涉及图片、签名、印章、手写、版式或表格，已额外转成页面图片补充读取。'
           : 'PDF 文本层未提取到内容，已自动转成页面图片继续读取。',
         `${isSupplement ? '视觉补充页码' : '转图片页码'}: ${renderedPages.map(page => page.pageNumber).join(', ')}`,
-        `读取方式: ${renderedPages[0]?.renderer === 'pdftoppm' ? '系统 pdftoppm 渲染' : '内置 PDF.js 渲染'} + ${visionCapable ? '当前主模型读图' : '备用多模态 Provider / Cats reader proxy 回退读图'}`,
+        `读取方式: ${renderedPages[0]?.renderer === 'pdftoppm' ? '系统 pdftoppm 渲染' : '内置 PDF.js 渲染'} + ${visionCapable ? '当前主模型读图' : 'Cats reader proxy 读图'}`,
       ];
       const imageBlocks: ContentBlock[] = [];
 
@@ -1055,7 +1054,7 @@ export class ReadTool implements Tool {
   private formatReaderProxyFailure(proxyResult: ReaderProxyResult, visionCapable: boolean): string {
     const status = proxyResult.status;
     const attempts = proxyResult.attempts && proxyResult.attempts > 1
-      ? `已自动尝试 ${proxyResult.attempts} 次（含凭证切换或网络重试）。`
+      ? `已自动重试 ${proxyResult.attempts} 次。`
       : '';
     const rawError = String(proxyResult.error || 'unknown error').trim();
     const shortError = rawError.length > 500 ? `${rawError.slice(0, 500)}...` : rawError;
@@ -1063,15 +1062,15 @@ export class ReadTool implements Tool {
     let title = '读图失败：读图服务暂时没有返回可用结果。';
     let action = '可以稍后重试，或先把图片里的关键文字/区域用文字补充一下。';
 
-    if (/could not find the current CatsCo account|requires CATSCOMPANY_API_KEY|READER_PROXY_API_KEY|apiKey/i.test(rawError)) {
-      title = '读图失败：当前 CatsCo 登录或机器人绑定没有提供有效认证。';
-      action = '请重新登录 CatsCo 或重新绑定机器人；正常使用不需要单独配置 Reader Key。';
+    if (/requires CATSCOMPANY_API_KEY|READER_PROXY_API_KEY|apiKey/i.test(rawError)) {
+      title = '读图失败：读图服务配置缺失。';
+      action = '请检查 CatsCo API Key / Reader Proxy API Key 是否已配置到 CatsCo 桌面端。';
     } else if (status === 400) {
       title = '读图失败：图片请求格式不被服务接受。';
       action = '请确认上传的是常见图片格式（png/jpg/jpeg/webp/gif/bmp），必要时重新截图后再发。';
     } else if (status === 401 || status === 403) {
       title = '读图失败：读图服务鉴权失败。';
-      action = '请重新登录 CatsCo 或重新绑定机器人，并确认账号仍有读图权限。';
+      action = '请检查 CatsCo API Key 是否正确、是否仍然有效，以及当前机器人是否有权限调用读图服务。';
     } else if (status === 404) {
       title = '读图失败：读图服务地址不正确。';
       action = '请检查 Reader Proxy URL / CatsCo HTTP Base URL 是否指向正确服务。';
@@ -1103,22 +1102,6 @@ export class ReadTool implements Tool {
     ].filter(Boolean).join('\n');
   }
 
-  private formatFallbackImageAnalysis(
-    absolutePath: string,
-    filePath: string,
-    visiblePath: string,
-    metadataType: string | undefined,
-    intro: string,
-    analysis: string,
-  ): string {
-    return [
-      this.formatImageMetadata(absolutePath, filePath, visiblePath, metadataType),
-      '',
-      intro,
-      analysis,
-    ].join('\n');
-  }
-
   private async readImage(
     absolutePath: string,
     filePath: string,
@@ -1129,8 +1112,7 @@ export class ReadTool implements Tool {
   ): Promise<any> {
     const config = ConfigManager.getConfigReadonly();
     const imagePrompt = this.getImageReadPrompt(context, prompt);
-    const visionState = await resolvePrimaryModelVisionCapability(config);
-    const visionCapable = visionState === 'supported';
+    const visionCapable = isPrimaryModelVisionCapable(config);
     const modelName = config.model || 'unknown';
 
     if (visionCapable) {
@@ -1146,35 +1128,29 @@ export class ReadTool implements Tool {
       }
       Logger.warning(`[CatsCo] vision_fallback_read_file model=${modelName} tool=read_file file=${logFile} reason=image_block_create_failed path=${logFile}`);
     } else {
-      Logger.info(`[CatsCo] vision_fallback_read_file model=${modelName} tool=read_file file=${formatPathForLog(absolutePath || filePath)} reason=${visionState === 'unsupported' ? 'model_not_vision_capable' : 'model_capability_unknown'}`);
+      Logger.info(`[CatsCo] vision_fallback_read_file model=${modelName} tool=read_file file=${formatPathForLog(absolutePath || filePath)} reason=model_not_vision_capable`);
     }
 
     const visionFallbackResult = await analyzeImageWithVisionFallback({
       filePath: absolutePath,
       prompt: imagePrompt,
       config,
-      signal: context.abortSignal,
     });
-    if (context.abortSignal?.aborted) {
-      throw new Error('读取已取消');
-    }
 
     if (visionFallbackResult.ok && visionFallbackResult.analysis) {
-      Logger.info(`[CatsCo] vision_fallback_provider_success primary_model=${modelName} provider_model=${visionFallbackResult.providerModel || 'unknown'} tool=read_file file=${formatPathForLog(absolutePath || filePath)}`);
-      return this.formatFallbackImageAnalysis(
-        absolutePath,
-        filePath,
-        visiblePath,
-        options?.metadataType,
+      Logger.info(`[CatsCo] vision_fallback_provider_success model=${modelName} tool=read_file file=${formatPathForLog(absolutePath || filePath)}`);
+      return [
+        this.formatImageMetadata(absolutePath, filePath, visiblePath, options?.metadataType),
+        '',
         options?.proxyIntro || (visionCapable
           ? '主模型图片块生成失败，已自动改用备用多模态 Provider 解析：'
           : '读图结果（由备用多模态 Provider 解析，已作为 read_file 结果返回给当前非多模态主模型）：'),
         visionFallbackResult.analysis,
-      );
+      ].join('\n');
     }
 
     if (visionFallbackResult.configured) {
-      Logger.warning(`[CatsCo] vision_fallback_provider_failed primary_model=${modelName} provider_model=${visionFallbackResult.providerModel || 'unresolved'} tool=read_file file=${formatPathForLog(absolutePath || filePath)} status=${visionFallbackResult.status || 'unknown'} error=${visionFallbackResult.error || 'unknown'}`);
+      Logger.warning(`[CatsCo] vision_fallback_provider_failed model=${modelName} tool=read_file file=${formatPathForLog(absolutePath || filePath)} status=${visionFallbackResult.status || 'unknown'} error=${visionFallbackResult.error || 'unknown'}`);
     }
 
     const proxyResult = await analyzeImageWithReaderProxy({
@@ -1184,16 +1160,14 @@ export class ReadTool implements Tool {
     });
 
     if (proxyResult.ok && proxyResult.analysis) {
-      return this.formatFallbackImageAnalysis(
-        absolutePath,
-        filePath,
-        visiblePath,
-        options?.metadataType,
+      return [
+        this.formatImageMetadata(absolutePath, filePath, visiblePath, options?.metadataType),
+        '',
         options?.proxyIntro || (visionCapable
           ? '主模型图片块生成失败，已自动改用 Cats reader proxy 解析：'
           : '读图结果（由 Cats reader proxy 解析，已作为 read_file 结果返回给当前非多模态主模型）：'),
         proxyResult.analysis,
-      );
+      ].join('\n');
     }
 
     const providerFailure = visionFallbackResult.configured

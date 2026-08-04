@@ -124,7 +124,6 @@ export function makeRunnerHint(lines: string[]): Message {
   return {
     role: 'system',
     content: [TRANSIENT_RUNNER_HINT_PREFIX, ...lines].join('\n'),
-    __cacheScope: 'dynamic',
   };
 }
 

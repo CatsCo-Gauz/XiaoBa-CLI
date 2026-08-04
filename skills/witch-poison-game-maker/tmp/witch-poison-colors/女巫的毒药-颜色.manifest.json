@@ -1,0 +1,21 @@
+{
+  "skill": "witch-poison-game-maker",
+  "rule_version": "1.3.1",
+  "html_path": "/Users/umazhong/Library/Application Support/xiaoba-cli/skills/witch-poison-game-maker/tmp/witch-poison-colors/女巫的毒药-颜色.html",
+  "words": [
+    "purple",
+    "green",
+    "red",
+    "black",
+    "yellow",
+    "blue",
+    "grey",
+    "brown",
+    "white",
+    "orange"
+  ],
+  "board_size": 25,
+  "teams": 2,
+  "poisons_per_team": 3,
+  "poison_overlap_allowed": true
+}

@@ -178,6 +178,80 @@ describe('CatsCompany client body identity', () => {
     client.disconnect();
   });
 
+  test('replays messages missed during websocket reconnect exactly once', async () => {
+    const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+    servers.push(server);
+    await new Promise<void>(resolve => server.once('listening', resolve));
+
+    let connections = 0;
+    const replayRequest = new Promise<any>(resolve => {
+      server.on('connection', socket => {
+        connections++;
+        const connectionNumber = connections;
+        socket.on('message', data => {
+          const msg = JSON.parse(data.toString());
+          if (msg.hi) {
+            socket.send(JSON.stringify({
+              ctrl: {
+                code: 200,
+                params: { build: 'catscompany', uid: 63, name: 'test-agent', features: [] },
+              },
+            }));
+            if (connectionNumber === 1) {
+              socket.send(JSON.stringify({
+                data: { topic: 'grp-test', from: 'usr1', seq: 10, type: 'text', content: 'before disconnect' },
+              }));
+              setTimeout(() => socket.close(), 5);
+            }
+            return;
+          }
+          if (connectionNumber === 2 && msg.get?.what === 'history') {
+            resolve(msg.get);
+            const replayed = {
+              data: { topic: 'grp-test', from: 'usr1', seq: 11, type: 'text', content: 'missed during disconnect' },
+            };
+            socket.send(JSON.stringify(replayed));
+            socket.send(JSON.stringify(replayed));
+            socket.send(JSON.stringify({
+              ctrl: { id: msg.get.id, code: 200, text: 'history complete' },
+            }));
+          }
+        });
+      });
+    });
+
+    const address = server.address() as AddressInfo;
+    const client = new CatsClient({
+      serverUrl: `ws://127.0.0.1:${address.port}`,
+      apiKey: 'cc-test-key',
+      bodyId: 'body-test',
+      reconnectBaseDelayMs: 10,
+      reconnectMaxDelayMs: 10,
+    });
+    client.on('error', () => undefined);
+    const receivedSeqs: number[] = [];
+    const recovered = new Promise<void>(resolve => {
+      client.on('message', message => {
+        receivedSeqs.push(Number(message.seq || 0));
+        if (receivedSeqs.length === 2) resolve();
+      });
+    });
+
+    try {
+      client.connect();
+      const request = await withTimeout(replayRequest);
+      await withTimeout(recovered);
+      await new Promise(resolve => setTimeout(resolve, 20));
+
+      assert.equal(request.topic, 'grp-test');
+      assert.equal(request.what, 'history');
+      assert.equal(request.seq, 10);
+      assert.deepEqual(receivedSeqs, [10, 11]);
+    } finally {
+      client.disconnect();
+    }
+  });
+
   test('keeps the process alive while waiting to reconnect', () => {
     const client = new CatsClient({
       serverUrl: 'ws://127.0.0.1:1',

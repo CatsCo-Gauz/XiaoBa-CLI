@@ -2,10 +2,6 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { PathResolver } from '../utils/path-resolver';
 import { Logger } from '../utils/logger';
-import {
-  scheduleCurrentBotSkillSync,
-  withCurrentBotSkillWorkspaceWrite,
-} from '../bot-skills/runtime';
 import { loadSkillHubConfig } from './config';
 import { DEFAULT_SKILLHUB_SKILLS, DefaultSkillHubSkill } from './default-skills';
 import { SkillHubService } from './service';
@@ -65,18 +61,6 @@ export function bootstrapDefaultSkillHubSkillsOnce(
 
 export async function bootstrapDefaultSkillHubSkills(
   options: DefaultSkillBootstrapOptions = {},
-): Promise<DefaultSkillBootstrapResult[]> {
-  const results = await withCurrentBotSkillWorkspaceWrite(
-    () => bootstrapDefaultSkillHubSkillsLocked(options),
-  );
-  if (results.some(result => result.action === 'installed')) {
-    scheduleCurrentBotSkillSync();
-  }
-  return results;
-}
-
-async function bootstrapDefaultSkillHubSkillsLocked(
-  options: DefaultSkillBootstrapOptions,
 ): Promise<DefaultSkillBootstrapResult[]> {
   const defaults = (options.skills ?? DEFAULT_SKILLHUB_SKILLS).filter(isValidDefaultSkill);
   if (!defaults.length) return [];

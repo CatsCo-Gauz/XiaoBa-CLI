@@ -1,9 +1,5 @@
 import type { Router } from 'express';
 import { SkillHubService } from '../../skillhub/service';
-import {
-  scheduleCurrentBotSkillSync,
-  withCurrentBotSkillWorkspaceWrite,
-} from '../../bot-skills/runtime';
 
 export interface SkillHubCatsCoAuthPayload {
   token: string;
@@ -91,14 +87,7 @@ export function registerSkillHubRoutes(router: Router, options: SkillHubRouteOpt
     try {
       const skillId = String(req.body?.skillId || '').trim();
       if (!skillId) return res.status(400).json({ error: 'skillId required' });
-      const result = await withCurrentBotSkillWorkspaceWrite(() => (
-        serviceFrom(req.body).install(
-          skillId,
-          String(req.body?.version || '').trim() || undefined,
-        )
-      ));
-      scheduleCurrentBotSkillSync();
-      res.json(result);
+      res.json(await serviceFrom(req.body).install(skillId, String(req.body?.version || '').trim() || undefined));
     } catch (error: any) {
       sendSkillHubError(res, error);
     }

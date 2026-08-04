@@ -4,7 +4,6 @@ import { estimateMessagesTokens, estimateTokens } from './token-estimator';
 import { Logger } from '../utils/logger';
 import { Metrics } from '../utils/metrics';
 import { readRequiredDefaultPromptFile, renderPromptTemplate } from '../utils/prompt-template';
-import { collectRemoteContextWatermarks } from './remote-context-watermarks';
 
 const COMPACT_BOUNDARY_PREFIX = '[compact_boundary]';
 const RECENT_EPISODE_CONTEXT_PREFIX = '[recent_episode_context]';
@@ -393,7 +392,6 @@ export class ContextCompressor {
       ? { customInstructions: optionsOrCustomInstructions }
       : (optionsOrCustomInstructions || {});
     const before = estimateMessagesTokens(messages);
-    const remoteContextWatermarks = collectRemoteContextWatermarks(messages);
 
     const system = messages.filter(m => m.role === 'system');
     const session = messages.filter(m => m.role !== 'system' && !isTransientCompactionMessage(m));
@@ -453,9 +451,6 @@ export class ContextCompressor {
       const summaryMessage: Message = {
         role: 'user',
         content: `[以下是之前 ${recentPlan.summaryMessages.length} 条对话的 AI 摘要]\n\n${summaryText}`,
-        ...(Object.keys(remoteContextWatermarks).length > 0
-          ? { __remoteContextWatermarks: remoteContextWatermarks }
-          : {}),
       };
 
       // 组装：system + boundary + summary（session 历史已被全量摘要，不再保留）

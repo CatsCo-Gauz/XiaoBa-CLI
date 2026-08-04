@@ -93,7 +93,6 @@ for (const promptPath of [
   'prompts/system-prompt.md',
   'prompts/runtime-context.md',
   'prompts/compact-system.md',
-  'prompts/checkpoint-compact-system.md',
   'prompts/subagents/system.md',
   'prompts/subagents/skill-author.md',
   'prompts/subagents/skill-verifier.md',

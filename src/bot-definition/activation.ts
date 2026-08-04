@@ -2,13 +2,9 @@ import { createCatsCoLocalConfigService, type CatsCoAuthSnapshot } from '../cats
 import {
   provisionCatsRelayCatalogRuntime,
   refreshCatsRelayCatalogRuntimeCapabilities,
-  validateCatsRelayCatalogRuntimeCredential,
-  RelayCredentialRejectedError,
-  RelayCredentialUnreachableError,
 } from '../catscompany/relay-model-bootstrap';
 import { DEFAULT_CATSCO_RELAY_MODEL_ID } from '../utils/relay-model-profiles';
 import { Logger } from '../utils/logger';
-import { prepareBoundBotSkills, type PreparedBoundBotSkills } from '../bot-skills/runtime';
 import {
   catalogRuntimeMatchesModelId,
   createBotDefinitionSyncService,
@@ -17,14 +13,11 @@ import {
 import type { BotCatalogModelRuntime, BotDefinition, BotDefinitionSyncResult } from './types';
 import { getPromptReconcileCoordinator } from './prompt-sync';
 import {
-  acknowledgeCloudBotDefinition,
   acknowledgeCloudBotModelSelection,
-  pullLegacyCloudBotModelSelection,
   pullCloudBotModelSelection,
   redactCloudBotModelError,
   type CloudBotModelSelection,
 } from './cloud-client';
-import { createBotDefinitionCloudSyncService } from './cloud-sync';
 
 export interface PrepareBoundBotDefinitionOptions extends BotDefinitionSyncServiceOptions {
   runtimeRoot: string;
@@ -34,7 +27,6 @@ export interface PrepareBoundBotDefinitionOptions extends BotDefinitionSyncServi
   fetchImpl?: typeof fetch;
   cloudSelection?: CloudBotModelSelection;
   acknowledgeCloudSelection?: boolean;
-  prepareSkills?: boolean;
 }
 
 export interface PreparedBoundBotDefinition {
@@ -46,7 +38,6 @@ export interface PreparedBoundBotDefinition {
   cloudRevision?: number;
   cloudSelection?: CloudBotModelSelection;
   cloudApplyError?: string;
-  skillSync?: PreparedBoundBotSkills;
 }
 
 /**
@@ -56,7 +47,7 @@ export interface PreparedBoundBotDefinition {
 export async function prepareBoundBotDefinition(
   options: PrepareBoundBotDefinitionOptions,
 ): Promise<PreparedBoundBotDefinition | undefined> {
-  const localConfig = createCatsCoLocalConfigService({ runtimeRoot: options.runtimeRoot, env: options.env }).load();
+  const localConfig = createCatsCoLocalConfigService({ runtimeRoot: options.runtimeRoot }).load();
   const botId = String(options.botId || localConfig.currentBot?.uid || '').trim();
   if (!botId) return undefined;
 
@@ -67,158 +58,10 @@ export async function prepareBoundBotDefinition(
   }
   let sync = definitionService.pullOrBootstrap(botId);
   let localDefinition = sync?.definition;
-  let initializedDefaultFromEmpty = false;
-  const auth = options.auth ?? createCatsCoLocalConfigService({ runtimeRoot: options.runtimeRoot, env: options.env }).getAuthState();
-  const cloudDefinitionSync = createBotDefinitionCloudSyncService({
-    runtimeRoot: options.runtimeRoot,
-    env: options.env,
-    definitionService,
-    fetchImpl: options.fetchImpl,
-  });
-
-  if (!options.cloudSelection) {
-    try {
-      let cloudSnapshot = await cloudDefinitionSync.reconcileStartup(botId, auth);
-      if (cloudSnapshot) {
-        if (selectedCatalogRuntime) {
-          definitionService.storeCatalogRuntime(selectedCatalogRuntime);
-          sync = definitionService.updateModel(botId, {
-            kind: 'catalog',
-            modelId: selectedCatalogRuntime.modelId,
-          });
-          cloudDefinitionSync.markModelPending(botId);
-          cloudSnapshot = await cloudDefinitionSync.pushModel(botId, auth, sync.definition.model)
-            ?? cloudSnapshot;
-        }
-
-        if (!cloudSnapshot.configured) {
-          localDefinition = definitionService.read(botId) ?? definitionService.pullOrBootstrap(botId)?.definition;
-          if (!localDefinition) {
-            const runtime = await provisionCatsRelayCatalogRuntime({
-              botId,
-              modelId: DEFAULT_CATSCO_RELAY_MODEL_ID,
-              auth,
-              fetchImpl: options.fetchImpl,
-            });
-            definitionService.storeCatalogRuntime(runtime);
-            sync = definitionService.updateModel(botId, {
-              kind: 'catalog',
-              modelId: DEFAULT_CATSCO_RELAY_MODEL_ID,
-            });
-            localDefinition = sync.definition;
-            initializedDefaultFromEmpty = true;
-          }
-          await getPromptReconcileCoordinator({
-            runtimeRoot: options.runtimeRoot,
-            env: options.env,
-            definitionService,
-          }).activateBot(botId);
-          const migrated = definitionService.read(botId)!;
-          cloudDefinitionSync.markModelPending(botId);
-          await cloudDefinitionSync.pushModel(botId, auth, migrated.model);
-          if (migrated.prompt) {
-            cloudDefinitionSync.markPromptPending(botId);
-            cloudSnapshot = await cloudDefinitionSync.pushPrompt(botId, auth, migrated.prompt)
-              ?? cloudSnapshot;
-          }
-          cloudSnapshot = await cloudDefinitionSync.pull(botId, auth) ?? cloudSnapshot;
-        }
-
-        let definition = definitionService.read(botId);
-        if (!definition) throw new Error('CatsCo cloud BotDefinition did not produce a local cache.');
-        definitionService.clearCloudModelOverride(botId);
-        let materializedCatalogRuntime = false;
-        if (definition.model.kind === 'catalog') {
-          const runtime = definitionService.readCatalogRuntime(botId);
-          if (!runtime || !catalogRuntimeMatchesModelId(runtime, definition.model.modelId)) {
-            const materialized = await provisionCatsRelayCatalogRuntime({
-              botId,
-              modelId: definition.model.modelId,
-              reasoningEffort: definition.model.reasoningEffort,
-              existingRuntime: runtime,
-              auth,
-              fetchImpl: options.fetchImpl,
-            });
-            definitionService.storeCatalogRuntime(materialized);
-            materializedCatalogRuntime = true;
-          } else if (catalogCapabilitiesNeedRefresh(runtime)) {
-            const refreshed = await refreshCatsRelayCatalogRuntimeCapabilities(runtime, options.fetchImpl ?? fetch);
-            if (refreshed !== runtime) definitionService.storeCatalogRuntime(refreshed);
-          }
-        }
-        const promptCoordinator = getPromptReconcileCoordinator({
-          runtimeRoot: options.runtimeRoot,
-          env: options.env,
-          definitionService,
-        });
-        await promptCoordinator.activateBot(botId, { preferDefinition: true });
-        definition = definitionService.read(botId)!;
-        if (!cloudSnapshot.definition?.prompt && definition.prompt) {
-          cloudDefinitionSync.markPromptPending(botId);
-          cloudSnapshot = await cloudDefinitionSync.pushPrompt(botId, auth, definition.prompt)
-            ?? cloudSnapshot;
-        }
-        const skillSync = options.prepareSkills === false
-          ? undefined
-          : await prepareBoundBotSkills({
-              runtimeRoot: options.runtimeRoot,
-              botId,
-              auth,
-              fetchImpl: options.fetchImpl,
-              definitionService,
-            });
-        definition = definitionService.read(botId) ?? definition;
-        const appliedRevision = skillSync?.sync?.cloudRevision ?? cloudSnapshot.revision;
-        definitionService.clearLegacyModelConfigurationWhenReady(definition);
-        if (
-          options.acknowledgeCloudSelection !== false
-          && cloudSnapshot.configured
-          && !skillSync?.localPreservedAfterError
-        ) {
-          try {
-            await acknowledgeCloudBotDefinition(
-              { botId, auth, fetchImpl: options.fetchImpl },
-              appliedRevision,
-            );
-          } catch (error) {
-            Logger.warning(`CatsCo BotDefinition apply acknowledgement failed: ${errorMessage(error)}`);
-          }
-        }
-        return {
-          botId,
-          definition,
-          sync,
-          initializedDefault: initializedDefaultFromEmpty,
-          materializedCatalogRuntime,
-          cloudRevision: appliedRevision,
-          ...(skillSync ? { skillSync } : {}),
-          cloudSelection: definition.model.kind === 'custom'
-            ? {
-              kind: 'custom',
-              modelId: definition.model.model,
-              customModel: definition.model,
-              revision: appliedRevision,
-              definition,
-            }
-            : {
-              kind: 'catalog',
-              modelId: definition.model.modelId,
-              ...(definition.model.reasoningEffort
-                ? { reasoningEffort: definition.model.reasoningEffort }
-                : {}),
-              revision: appliedRevision,
-              definition,
-            },
-        };
-      }
-    } catch (error) {
-      Logger.warning(`CatsCo BotDefinition cloud sync is temporarily unavailable; using local cache: ${errorMessage(error)}`);
-    }
-  }
-
   const previousCloudDefinition = definitionService.readCloudModelOverride(botId);
   const previousCloudRuntime = definitionService.readCloudCatalogRuntime(botId);
   let definition = previousCloudDefinition ?? localDefinition;
+  const auth = options.auth ?? createCatsCoLocalConfigService({ runtimeRoot: options.runtimeRoot }).getAuthState();
   let initializedDefault = false;
   let materializedCatalogRuntime = false;
   let cloudSelection = options.cloudSelection;
@@ -229,7 +72,7 @@ export async function prepareBoundBotDefinition(
 
   if (!cloudSelection) {
     try {
-      cloudSelection = await pullLegacyCloudBotModelSelection({
+      cloudSelection = await pullCloudBotModelSelection({
         botId,
         auth,
         fetchImpl: options.fetchImpl,
@@ -274,7 +117,6 @@ export async function prepareBoundBotDefinition(
             const materialized = await provisionCatsRelayCatalogRuntime({
               botId,
               modelId: localDefinition.model.modelId,
-              existingRuntime: runtime,
               auth,
               fetchImpl: options.fetchImpl,
             });
@@ -302,48 +144,19 @@ export async function prepareBoundBotDefinition(
             botId,
             modelId: cloudSelection.modelId,
             reasoningEffort: cloudSelection.reasoningEffort,
-            existingRuntime: runtime ?? definitionService.readCatalogRuntime(botId),
             auth,
             fetchImpl: options.fetchImpl,
           });
           definitionService.storeCloudCatalogRuntime(materialized);
           materializedCatalogRuntime = true;
-        } else {
-          let effectiveRuntime = runtime;
-          try {
-            await validateCatsRelayCatalogRuntimeCredential(runtime, options.fetchImpl ?? fetch);
-          } catch (error) {
-            if (error instanceof RelayCredentialRejectedError) {
-              // 凭据确实被吊销：有登录态则重新物化，否则交由外层回滚
-              if (!auth?.token) throw error;
-              effectiveRuntime = await provisionCatsRelayCatalogRuntime({
-                botId,
-                modelId: cloudSelection.modelId,
-                reasoningEffort: cloudSelection.reasoningEffort,
-                existingRuntime: runtime,
-                auth,
-                fetchImpl: options.fetchImpl,
-              });
-              definitionService.storeCloudCatalogRuntime(effectiveRuntime);
-              materializedCatalogRuntime = true;
-            } else if (error instanceof RelayCredentialUnreachableError) {
-              // 暂时不可达（5xx/超时/网络）：不阻断，继续使用当前 runtime
-              Logger.warning(
-                `CatsCo relay 凭据暂时无法验证，继续使用当前模型: ${errorMessage(error)}`,
-              );
-            } else {
-              throw error;
-            }
-          }
-          if (
-            cloudSelection.reasoningEffort
-            && effectiveRuntime.reasoningEffort !== cloudSelection.reasoningEffort
-          ) {
-            definitionService.storeCloudCatalogRuntime({
-              ...effectiveRuntime,
-              reasoningEffort: cloudSelection.reasoningEffort,
-            });
-          }
+        } else if (
+          cloudSelection.reasoningEffort
+          && runtime.reasoningEffort !== cloudSelection.reasoningEffort
+        ) {
+          definitionService.storeCloudCatalogRuntime({
+            ...runtime,
+            reasoningEffort: cloudSelection.reasoningEffort,
+          });
         }
         sync = definitionService.acceptCloud(botId, cloudModel);
         definition = sync.definition;
@@ -434,7 +247,6 @@ export async function prepareBoundBotDefinition(
       const materialized = await provisionCatsRelayCatalogRuntime({
         botId,
         modelId: definition.model.modelId,
-        existingRuntime: runtime,
         auth,
         fetchImpl: options.fetchImpl,
       });
@@ -462,26 +274,6 @@ export async function prepareBoundBotDefinition(
     env: options.env,
     definitionService,
   }).activateBot(botId);
-  const skillSync = (
-    options.prepareSkills === false
-    || (cloudSelection && !cloudSelection.definition)
-  )
-    ? undefined
-    : await prepareBoundBotSkills({
-        runtimeRoot: options.runtimeRoot,
-        botId,
-        auth,
-        fetchImpl: options.fetchImpl,
-        definitionService,
-      });
-  const portableDefinition = definitionService.read(botId);
-  if (portableDefinition) {
-    definition = {
-      ...definition,
-      ...(portableDefinition.prompt ? { prompt: portableDefinition.prompt } : {}),
-      ...(portableDefinition.skills !== undefined ? { skills: portableDefinition.skills } : {}),
-    };
-  }
   return {
     botId,
     definition,
@@ -491,7 +283,6 @@ export async function prepareBoundBotDefinition(
     ...(cloudSelection ? { cloudSelection } : {}),
     ...(cloudApplyError ? { cloudApplyError } : {}),
     ...(cloudSelectionApplied && cloudSelection ? { cloudRevision: cloudSelection.revision } : {}),
-    ...(skillSync ? { skillSync } : {}),
   };
 }
 

@@ -1,5 +1,4 @@
 import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
-import { StringDecoder } from 'string_decoder';
 
 export interface ProcessRunOptions {
   id?: string;
@@ -43,8 +42,6 @@ export class ProcessRunner {
       });
       let stdout = '';
       let stderr = '';
-      const stdoutDecoder = new StringDecoder('utf8');
-      const stderrDecoder = new StringDecoder('utf8');
       let settled = false;
 
       this.active.set(id, child);
@@ -69,10 +66,10 @@ export class ProcessRunner {
       }
 
       child.stdout.on('data', chunk => {
-        stdout += stdoutDecoder.write(chunk);
+        stdout += chunk.toString();
       });
       child.stderr.on('data', chunk => {
-        stderr += stderrDecoder.write(chunk);
+        stderr += chunk.toString();
       });
 
       child.on('error', error => {
@@ -90,8 +87,6 @@ export class ProcessRunner {
         this.active.delete(id);
         if (timeout) clearTimeout(timeout);
         if (options.signal) options.signal.removeEventListener('abort', abort);
-        stdout += stdoutDecoder.end();
-        stderr += stderrDecoder.end();
         resolve({
           id,
           command: options.command,

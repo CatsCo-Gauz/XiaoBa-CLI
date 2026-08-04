@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cloud HTML Artifact"
+  short_description: "Publish built static web output through employee HTTPS."
+  default_prompt: "Use $cloud-html-artifact to publish this already-built browser-runnable directory from the current virtual employee server, ensure its canonical trusted HTTPS host, verify its version and latest URLs, and add it to the server-local artifact index."

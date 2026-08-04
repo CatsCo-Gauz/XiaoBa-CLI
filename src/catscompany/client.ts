@@ -230,6 +230,10 @@ export class CatsClient extends EventEmitter {
   private reconnectTimer: NodeJS.Timeout | null = null;
   private reconnectAttempts = 0;
   private subscribedTopics = new Set<string>();
+  private lastMessageSeqByTopic = new Map<string, number>();
+  private historyRecoveryByRequest = new Map<string, { topic: string; afterSeq: number }>();
+  private historyRecoveryFloorByTopic = new Map<string, number>();
+  private historyRecoverySeenSeqsByTopic = new Map<string, Set<number>>();
   private supportsClientMessageDedupe = false;
   public supportsThinToolRpc = false;
   private supportsDeviceRpcProgress = false;
@@ -308,6 +312,9 @@ export class CatsClient extends EventEmitter {
       this.awaitingReady = false;
       this.stopHeartbeat();
       this.ws = null;
+      this.historyRecoveryByRequest.clear();
+      this.historyRecoveryFloorByTopic.clear();
+      this.historyRecoverySeenSeqsByTopic.clear();
       this.rejectPendingAcks(new CatsSendError(
         'timeout',
         'WebSocket 在收到 CatsCompany 服务器确认前关闭',
@@ -360,10 +367,29 @@ export class CatsClient extends EventEmitter {
         this.autoAcceptFriendRequests().catch(console.error);
         this.resubscribeTopics();
       } else if (msg.ctrl.id) {
-        const pending = this.pendingAcks.get(msg.ctrl.id);
+        const controlID = String(msg.ctrl.id);
+        const recovery = this.historyRecoveryByRequest.get(controlID);
+        if (recovery) {
+          this.historyRecoveryByRequest.delete(controlID);
+          this.historyRecoveryFloorByTopic.delete(recovery.topic);
+          this.historyRecoverySeenSeqsByTopic.delete(recovery.topic);
+          if (msg.ctrl.code >= 200 && msg.ctrl.code < 300) {
+            Logger.info(
+              `[CatsCompany] 断线消息补拉完成: topic=${recovery.topic}, after_seq=${recovery.afterSeq}, `
+              + `latest_seq=${this.lastMessageSeqByTopic.get(recovery.topic) || recovery.afterSeq}`
+            );
+          } else {
+            Logger.warning(
+              `[CatsCompany] 断线消息补拉失败: topic=${recovery.topic}, after_seq=${recovery.afterSeq}, `
+              + `code=${msg.ctrl.code}, reason=${msg.ctrl.text || 'request failed'}`
+            );
+          }
+          return;
+        }
+        const pending = this.pendingAcks.get(controlID);
         if (pending) {
           clearTimeout(pending.timer);
-          this.pendingAcks.delete(msg.ctrl.id);
+          this.pendingAcks.delete(controlID);
           if (msg.ctrl.code >= 200 && msg.ctrl.code < 300) {
             pending.resolve(Number(msg.ctrl.params?.seq || 0));
           } else {
@@ -380,13 +406,37 @@ export class CatsClient extends EventEmitter {
     } else if (msg.thin_tool_rpc) {
       this.handleThinToolRpcMessage(msg.thin_tool_rpc);
     } else if (msg.data) {
+      const topic = String(msg.data.topic || '');
+      const seq = Number(msg.data.seq || 0);
+      if (topic && Number.isSafeInteger(seq) && seq > 0) {
+        const recoveryFloor = this.historyRecoveryFloorByTopic.get(topic);
+        if (recoveryFloor !== undefined) {
+          let seen = this.historyRecoverySeenSeqsByTopic.get(topic);
+          if (!seen) {
+            seen = new Set<number>();
+            this.historyRecoverySeenSeqsByTopic.set(topic, seen);
+          }
+          if (seq <= recoveryFloor || seen.has(seq)) {
+            Logger.info(`[CatsCompany] 忽略断线补拉重复消息: topic=${topic}, seq=${seq}, floor=${recoveryFloor}`);
+            return;
+          }
+          seen.add(seq);
+        } else {
+          const lastSeq = this.lastMessageSeqByTopic.get(topic) || 0;
+          if (seq <= lastSeq) {
+            Logger.info(`[CatsCompany] 忽略重复消息: topic=${topic}, seq=${seq}, last_seq=${lastSeq}`);
+            return;
+          }
+        }
+        this.lastMessageSeqByTopic.set(topic, Math.max(this.lastMessageSeqByTopic.get(topic) || 0, seq));
+      }
       Logger.info(
-        `[CatsCompany] 收到消息: topic=${msg.data.topic || '-'}, ` +
+        `[CatsCompany] 收到消息: topic=${topic || '-'}, ` +
         `from=${msg.data.from || '-'}, seq=${msg.data.seq || '-'}, type=${msg.data.type || msg.data.msg_type || '-'}`
       );
-      this.subscribedTopics.add(msg.data.topic);
+      if (topic) this.subscribedTopics.add(topic);
       const ctx: MessageContext = {
-        topic: msg.data.topic || '',
+        topic,
         senderId: msg.data.from || '',
         text: typeof msg.data.content === 'string' ? msg.data.content : '',
         content: msg.data.content,
@@ -1042,8 +1092,28 @@ export class CatsClient extends EventEmitter {
       Logger.info(`[CatsCompany] 重新订阅 ${this.subscribedTopics.size} 个会话`);
       this.subscribedTopics.forEach(topic => {
         this.send({ sub: { topic } });
+        this.requestMissedMessages(topic);
       });
     }
+  }
+
+  private requestMissedMessages(topic: string): void {
+    const afterSeq = this.lastMessageSeqByTopic.get(topic) || 0;
+    if (afterSeq <= 0) return;
+
+    const requestID = `${++this.msgId}`;
+    this.historyRecoveryByRequest.set(requestID, { topic, afterSeq });
+    this.historyRecoveryFloorByTopic.set(topic, afterSeq);
+    this.historyRecoverySeenSeqsByTopic.set(topic, new Set<number>());
+    Logger.info(`[CatsCompany] 请求补拉断线消息: topic=${topic}, after_seq=${afterSeq}`);
+    this.send({
+      get: {
+        id: requestID,
+        topic,
+        what: 'history',
+        seq: afterSeq,
+      },
+    });
   }
 
   private httpBaseUrl(): string {

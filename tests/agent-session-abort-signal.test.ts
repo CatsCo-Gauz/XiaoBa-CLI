@@ -2,26 +2,6 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { AgentSession } from '../src/core/agent-session';
 
-test('AgentSession schedules Bot Skill workspace sync after a completed turn', async () => {
-  let scheduledSyncs = 0;
-  const session = new AgentSession('user:after-turn-skill-sync', buildMockServices({
-    afterTurnSkillSyncScheduler() {
-      scheduledSyncs++;
-    },
-    aiService: {
-      async chatStream() {
-        return { content: 'done', toolCalls: [] };
-      },
-    },
-  }), 'catscompany');
-  session.setSystemPromptProvider(() => 'system prompt');
-
-  const result = await session.handleMessage('update the current Skill');
-
-  assert.equal(result.text, 'done');
-  assert.equal(scheduledSyncs, 1);
-});
-
 test('AgentSession requestInterrupt aborts an in-flight model request', async () => {
   let observedSignal: AbortSignal | undefined;
 
@@ -117,13 +97,10 @@ test('AgentSession clear ignores stale context compaction that resolves after ab
   }), 'catscompany');
   session.setSystemPromptProvider(() => 'system prompt');
   (session as any).messages = [{ role: 'user', content: '压缩前的旧历史' }];
-  (session as any).checkpointCompactionCoordinator.compactIfNeeded = async (messages: any[], options: any) => {
+  (session as any).contextWindowManager.compactIfNeeded = async (messages: any[], options: any) => {
     compactionSignal = options.signal;
     await compactionGate;
-    return {
-      compacted: true,
-      messages: [...messages, { role: 'assistant', content: '不应恢复的旧压缩结果' }],
-    };
+    return [...messages, { role: 'assistant', content: '不应恢复的旧压缩结果' }];
   };
 
   const runPromise = session.handleMessage('压缩期间的新请求');
@@ -158,15 +135,12 @@ test('AgentSession clear ignores stale restore compaction during first initializ
   (session as any).lifecycleManager.consumePendingRestore = () => [
     { role: 'user', content: '不应恢复的云端旧历史' },
   ];
-  (session as any).checkpointCompactionCoordinator.compactIfNeeded = async (messages: any[], options: any) => {
+  (session as any).contextWindowManager.compactIfNeeded = async (messages: any[], options: any) => {
     compactionCalls++;
-    if (compactionCalls === 1) return { compacted: false, messages };
+    if (compactionCalls === 1) return messages;
     restoreCompactionSignal = options.signal;
     await restoreCompactionGate;
-    return {
-      compacted: true,
-      messages: [...messages, { role: 'assistant', content: '不应恢复的旧恢复压缩结果' }],
-    };
+    return [...messages, { role: 'assistant', content: '不应恢复的旧恢复压缩结果' }];
   };
 
   const runPromise = session.handleMessage('触发首次初始化');
@@ -196,12 +170,12 @@ test('clear commands prevent an interrupted restore turn from persisting after r
       { role: 'user', content: '不应在清空后保存的云端旧历史' },
     ];
     (session as any).lifecycleManager.saveContext = () => { saveCalls++; };
-    (session as any).checkpointCompactionCoordinator.compactIfNeeded = async (messages: any[], options: any) => {
+    (session as any).contextWindowManager.compactIfNeeded = async (messages: any[], options: any) => {
       compactionCalls++;
-      if (compactionCalls === 1) return { compacted: false, messages };
+      if (compactionCalls === 1) return messages;
       restoreCompactionSignal = options.signal;
       await restoreCompactionGate;
-      return { compacted: true, messages };
+      return messages;
     };
 
     const runPromise = session.handleMessage('触发首次初始化');
@@ -280,7 +254,6 @@ test('clear commands discard an initialized session prompt hot reload', async ()
 function buildMockServices(overrides: any = {}): any {
   return {
     aiService: overrides.aiService ?? {},
-    afterTurnSkillSyncScheduler: overrides.afterTurnSkillSyncScheduler,
     toolManager: overrides.toolManager ?? {
       getToolDefinitions() { return []; },
       executeTool() { throw new Error('not expected'); },

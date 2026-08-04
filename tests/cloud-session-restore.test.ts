@@ -13,7 +13,6 @@ import { estimateMessagesTokens } from '../src/core/token-estimator';
 
 class MemorySessionStore {
   readonly sessions = new Map<string, Message[]>();
-  readonly saveResults: boolean[] = [];
   saveCalls = 0;
   loadCalls = 0;
 
@@ -26,12 +25,9 @@ class MemorySessionStore {
     return this.sessions.get(sessionKey) || [];
   }
 
-  saveContext(sessionKey: string, messages: Message[]): boolean {
+  saveContext(sessionKey: string, messages: Message[]): void {
     this.saveCalls++;
-    const result = this.saveResults.shift() ?? true;
-    if (!result) return false;
     this.sessions.set(sessionKey, messages);
-    return true;
   }
 
 }
@@ -170,35 +166,7 @@ test('missing session restores eligible visible history and paginates oldest-fir
   ]);
 });
 
-test('missing session paginates beyond ten pages before persistence', async () => {
-  const store = new MemorySessionStore();
-  const pages = Array.from({ length: 11 }, (_, index) => {
-    const seq = 11 - index;
-    return page([
-      contextMessage({ id: seq, seq_id: seq, content: `message-${seq}` }),
-    ], {
-      has_more: index < 10,
-      next_before_id: seq,
-    });
-  });
-  const client = new FakeHistoryClient(pages);
-  const restorer = new CatsCompanyCloudSessionRestorer(client, fakeAIService, store);
-
-  const result = await restorer.restoreIfMissing({
-    sessionKey: 'eleven-page-session',
-    topicId: 'p2p_7_42',
-    topicType: 'p2p',
-    agentId: 'usr42',
-    currentSeq: 12,
-  });
-
-  assert.equal(result.status, 'restored');
-  assert.equal(client.calls.length, 11);
-  assert.deepEqual(store.sessions.get('eleven-page-session')?.map(message => message.content),
-    Array.from({ length: 11 }, (_, index) => `message-${index + 1}`));
-});
-
-test('group normalization keeps stable speakers for humans and other Agents while rejecting another scope', () => {
+test('group normalization keeps the speaker and rejects another agent scope', () => {
   const normalized = normalizeAgentContextMessages([
     contextMessage({
       topic_id: 'grp_80',
@@ -212,35 +180,14 @@ test('group normalization keeps stable speakers for humans and other Agents whil
       id: 2,
       seq_id: 2,
       topic_id: 'grp_80',
-      content: 'agent reply',
-      context_role: 'other_agent',
-      context_eligible: false,
-      context_reason: 'other_agent_message',
-      metadata: {
-        catsco_identity: {
-          actor: { display_name: 'Saturday', user_id: 'usr43' },
-        },
-      },
-    }),
-    contextMessage({
-      id: 3,
-      seq_id: 3,
-      topic_id: 'grp_80',
       agent_uid: 43,
       agent_id: 'usr43',
-      content: 'wrong agent scope',
+      content: 'wrong agent',
     }),
   ], { topicType: 'group', agentId: 'usr42' });
 
-  assert.deepEqual(normalized.map(message => message.content), [
-    '[发言人: Alice]\nhello',
-    '[发言人: Saturday]\nagent reply',
-  ]);
-  assert.deepEqual(normalized.map(message => message.role), ['user', 'user']);
-  assert.deepEqual(normalized.map(message => [message.__remoteContextSource, message.__remoteContextId]), [
-    ['catscompany.agent_context', 1],
-    ['catscompany.agent_context', 2],
-  ]);
+  assert.equal(normalized.length, 1);
+  assert.equal(normalized[0].content, '[群聊成员 Alice]\nhello');
 });
 
 test('the latest clear command cuts off older cloud history on every device', async () => {
@@ -295,9 +242,9 @@ test('an ordinary group member saying /clear does not truncate group history', a
 
   assert.equal(result.status, 'restored');
   assert.deepEqual(store.sessions.get('ordinary-clear-group')?.map(message => message.content), [
-    '[发言人: usr7]\nold discussion',
-    '[发言人: usr7]\n/clear',
-    '[发言人: usr7]\nnew discussion',
+    '[群聊成员 usr7]\nold discussion',
+    '[群聊成员 usr7]\n/clear',
+    '[群聊成员 usr7]\nnew discussion',
   ]);
 });
 
@@ -328,7 +275,7 @@ test('a group clear targeting the agent truncates older group history', async ()
 
   assert.equal(result.status, 'restored');
   assert.deepEqual(store.sessions.get('targeted-clear-group')?.map(message => message.content), [
-    '[发言人: usr7]\nnew discussion',
+    '[群聊成员 usr7]\nnew discussion',
   ]);
 });
 
@@ -399,43 +346,6 @@ test('markLocalSessionCleared persists an empty sentinel after a regular clear',
   assert.equal(store.saveCalls, 1);
 });
 
-test('markLocalSessionCleared retries once and reports a persistent failure', () => {
-  const store = new MemorySessionStore();
-  const restorer = new CatsCompanyCloudSessionRestorer(new FakeHistoryClient([]), fakeAIService, store);
-
-  store.saveResults.push(false, true);
-  assert.equal(restorer.markLocalSessionCleared('retry-clear'), true);
-  assert.equal(store.saveCalls, 2);
-  assert.deepEqual(store.sessions.get('retry-clear'), []);
-
-  store.saveResults.push(false, false);
-  assert.equal(restorer.markLocalSessionCleared('failed-clear'), false);
-  assert.equal(store.saveCalls, 4);
-  assert.equal(store.hasSession('failed-clear'), false);
-});
-
-test('cloud restore reports failed when durable history cannot be persisted', async () => {
-  const store = new MemorySessionStore();
-  store.saveResults.push(false);
-  const restorer = new CatsCompanyCloudSessionRestorer(
-    new FakeHistoryClient([page([contextMessage({ content: 'must retry later' })])]),
-    fakeAIService,
-    store,
-  );
-
-  const result = await restorer.restoreIfMissing({
-    sessionKey: 'failed-persistence',
-    topicId: 'p2p_7_42',
-    topicType: 'p2p',
-    agentId: 'usr42',
-    currentSeq: 2,
-  });
-
-  assert.equal(result.status, 'failed');
-  assert.equal(store.hasSession('failed-persistence'), false);
-  assert.equal(store.saveCalls, 1);
-});
-
 test('large cloud transcript is summarized before it is persisted', async () => {
   const store = new MemorySessionStore();
   const large = 'x'.repeat(260_000);
@@ -488,96 +398,6 @@ test('summary failure still bounds a single oversized history message', async ()
   assert.ok(estimateMessagesTokens(restored) <= 60_000);
   assert.match(String(restored[0]?.content), /设备恢复提示/);
   assert.match(String(restored[1]?.content), /已截断/);
-});
-
-test('summary timeout persists the bounded fallback instead of failing every retry', async () => {
-  const store = new MemorySessionStore();
-  const client = new FakeHistoryClient([
-    page([contextMessage({ content: 'x'.repeat(400_000) })]),
-  ]);
-  const timedOutAIService = {
-    chatStream: async (
-      _messages: Message[],
-      _tools: unknown,
-      _callbacks: unknown,
-      options: { signal?: AbortSignal } = {},
-    ) => await new Promise((_resolve, reject) => {
-      const signal = options.signal;
-      if (!signal) {
-        reject(new Error('missing summary timeout signal'));
-        return;
-      }
-      if (signal.aborted) {
-        reject(signal.reason);
-        return;
-      }
-      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
-    }),
-  } as any;
-  const restorer = new CatsCompanyCloudSessionRestorer(client, timedOutAIService, store);
-
-  const result = await restorer.restoreIfMissing({
-    sessionKey: 'summary-timeout-session',
-    topicId: 'p2p_7_42',
-    topicType: 'p2p',
-    agentId: 'usr42',
-    currentSeq: 2,
-    signal: AbortSignal.timeout(10),
-  });
-
-  assert.equal(result.status, 'restored');
-  assert.equal(result.compressed, true);
-  assert.equal(store.saveCalls, 1);
-  const restored = store.sessions.get('summary-timeout-session') || [];
-  assert.ok(estimateMessagesTokens(restored) <= 60_000);
-  assert.match(String(restored[0]?.content), /设备恢复提示/);
-});
-
-test('explicit cancellation during summary still prevents stale history persistence', async () => {
-  const store = new MemorySessionStore();
-  const client = new FakeHistoryClient([
-    page([contextMessage({ content: 'x'.repeat(400_000) })]),
-  ]);
-  let summaryStarted!: () => void;
-  const summaryStartedPromise = new Promise<void>(resolve => { summaryStarted = resolve; });
-  const cancelledAIService = {
-    chatStream: async (
-      _messages: Message[],
-      _tools: unknown,
-      _callbacks: unknown,
-      options: { signal?: AbortSignal } = {},
-    ) => await new Promise((_resolve, reject) => {
-      summaryStarted();
-      const signal = options.signal;
-      if (!signal) {
-        reject(new Error('missing cancellation signal'));
-        return;
-      }
-      if (signal.aborted) {
-        reject(signal.reason);
-        return;
-      }
-      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
-    }),
-  } as any;
-  const controller = new AbortController();
-  const restorer = new CatsCompanyCloudSessionRestorer(client, cancelledAIService, store);
-
-  const restoring = restorer.restoreIfMissing({
-    sessionKey: 'summary-cancelled-session',
-    topicId: 'p2p_7_42',
-    topicType: 'p2p',
-    agentId: 'usr42',
-    currentSeq: 2,
-    signal: controller.signal,
-  });
-  await summaryStartedPromise;
-  controller.abort();
-  const result = await restoring;
-
-  assert.equal(result.status, 'failed');
-  assert.equal(store.hasSession('summary-cancelled-session'), false);
-  assert.equal(store.saveCalls, 0);
 });
 
 test('history failure leaves the local session untouched for a later retry', async () => {

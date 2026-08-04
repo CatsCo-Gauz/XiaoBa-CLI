@@ -4,10 +4,6 @@ import { Logger } from '../utils/logger';
 import { SessionStore } from '../utils/session-store';
 import { stripAssistantTranscriptArtifacts } from '../utils/transcript-artifacts';
 import { ContextCompressor } from '../core/context-compressor';
-import {
-  CheckpointCompactionCoordinator,
-  isCheckpointCompactionEnabled,
-} from '../core/checkpoint-compaction';
 import { estimateMessagesTokens } from '../core/token-estimator';
 import type {
   CatsAgentContextMessage,
@@ -15,7 +11,9 @@ import type {
 } from './client';
 
 const CLOUD_RESTORE_PAGE_SIZE = 200;
+const CLOUD_RESTORE_MAX_PAGES = 10;
 const CLOUD_RESTORE_DIRECT_TOKEN_BUDGET = 60_000;
+const CLOUD_RESTORE_FETCH_TOKEN_BUDGET = 160_000;
 const CLOUD_RESTORE_FINAL_TOKEN_CEILING = 90_000;
 const CLOUD_RESTORE_SUMMARY_INPUT_BUDGET = 70_000;
 const CLOUD_RESTORE_RECENT_EPISODES = 12;
@@ -30,7 +28,7 @@ interface AgentContextHistoryClient {
 
 interface SessionContextStore {
   hasSession(sessionKey: string): boolean;
-  saveContext(sessionKey: string, messages: Message[]): boolean;
+  saveContext(sessionKey: string, messages: Message[]): void;
 }
 
 export interface CloudSessionRestoreRequest {
@@ -72,24 +70,13 @@ export class CatsCompanyCloudSessionRestorer {
         return this.result('empty', { fetchedMessages: fetched.fetchedMessages });
       }
 
-      const prepared = await this.prepareForPersistence(
-        fetched.messages,
-        request.sessionKey,
-        request.signal,
-      );
-      if (
-        request.signal?.aborted
-        && !(prepared.summaryFallback && isTimeoutAbortReason(request.signal.reason))
-      ) {
-        request.signal.throwIfAborted();
-      }
+      const prepared = await this.prepareForPersistence(fetched.messages, request.signal);
+      request.signal?.throwIfAborted();
       if (this.hasLocalSession(request.sessionKey)) {
         return this.result('local_present', { fetchedMessages: fetched.fetchedMessages });
       }
 
-      if (!this.sessionStore.saveContext(request.sessionKey, prepared.messages)) {
-        throw new Error('cloud session history could not be persisted');
-      }
+      this.sessionStore.saveContext(request.sessionKey, prepared.messages);
       Logger.info(
         `[${request.sessionKey}] 云端主会话恢复完成: fetched=${fetched.fetchedMessages}, `
         + `restored=${prepared.messages.length}, compressed=${prepared.compressed}`,
@@ -105,10 +92,8 @@ export class CatsCompanyCloudSessionRestorer {
     }
   }
 
-  markLocalSessionCleared(sessionKey: string): boolean {
-    if (this.sessionStore.saveContext(sessionKey, [])) return true;
-    Logger.warning(`[${sessionKey}] 清空哨兵首次落盘失败，立即重试一次`);
-    return this.sessionStore.saveContext(sessionKey, []);
+  markLocalSessionCleared(sessionKey: string): void {
+    this.sessionStore.saveContext(sessionKey, []);
   }
 
   private hasLocalSession(sessionKey: string): boolean {
@@ -124,7 +109,7 @@ export class CatsCompanyCloudSessionRestorer {
     let rawMessages: CatsAgentContextMessage[] = [];
     const seenMessageIds = new Set<number>();
 
-    for (;;) {
+    for (let pageIndex = 0; pageIndex < CLOUD_RESTORE_MAX_PAGES; pageIndex++) {
       const page = await this.client.getAgentContextHistory(request.topicId, {
         beforeId,
         limit: CLOUD_RESTORE_PAGE_SIZE,
@@ -146,11 +131,20 @@ export class CatsCompanyCloudSessionRestorer {
         ? orderedPage.slice(clearBoundaryIndex + 1)
         : orderedPage;
       rawMessages = [...pageMessages, ...rawMessages];
-      if (clearBoundaryIndex >= 0 || !page.has_more) break;
-      if (page.next_before_id <= 0 || page.next_before_id >= beforeId) {
-        throw new Error(`agent context pagination did not advance: ${page.next_before_id}`);
+      const normalizedMessages = coalesceAssistantSegments(normalizeAgentContextMessages(
+        [...rawMessages].sort((left, right) => agentContextMessageSeq(left) - agentContextMessageSeq(right)),
+        request,
+      ));
+
+      if (
+        clearBoundaryIndex >= 0
+        || !page.has_more
+        || page.next_before_id <= 0
+        || page.next_before_id >= beforeId
+        || estimateMessagesTokens(normalizedMessages) >= CLOUD_RESTORE_FETCH_TOKEN_BUDGET
+      ) {
+        break;
       }
-      request.signal?.throwIfAborted();
       beforeId = page.next_before_id;
     }
 
@@ -172,36 +166,14 @@ export class CatsCompanyCloudSessionRestorer {
 
   private async prepareForPersistence(
     messages: Message[],
-    sessionKey: string,
     signal?: AbortSignal,
-  ): Promise<{ messages: Message[]; compressed: boolean; summaryFallback: boolean }> {
+  ): Promise<{ messages: Message[]; compressed: boolean }> {
     const usedTokens = estimateMessagesTokens(messages);
     if (usedTokens <= CLOUD_RESTORE_DIRECT_TOKEN_BUDGET) {
-      return { messages, compressed: false, summaryFallback: false };
+      return { messages, compressed: false };
     }
 
     try {
-      if (isCheckpointCompactionEnabled()) {
-        const coordinator = new CheckpointCompactionCoordinator(this.aiService, {
-          maxContextTokens: CLOUD_RESTORE_FINAL_TOKEN_CEILING,
-          compactionThreshold: 0.65,
-          retainedUserTokenBudget: CLOUD_RESTORE_RECENT_TOKEN_BUDGET,
-        });
-        const result = await coordinator.compactIfNeeded(messages, {
-          sessionKey,
-          phase: 'restore',
-          signal,
-        });
-        if (!result.compacted) {
-          throw new Error('cloud restore checkpoint compaction did not produce a checkpoint');
-        }
-        return {
-          messages: trimToTokenBudget(result.messages, CLOUD_RESTORE_FINAL_TOKEN_CEILING),
-          compressed: true,
-          summaryFallback: false,
-        };
-      }
-
       const compressor = new ContextCompressor(this.aiService, {
         maxContextTokens: CLOUD_RESTORE_FINAL_TOKEN_CEILING,
         summaryContentBudget: CLOUD_RESTORE_SUMMARY_INPUT_BUDGET,
@@ -220,14 +192,12 @@ export class CatsCompanyCloudSessionRestorer {
       return {
         messages: trimToTokenBudget(compacted, CLOUD_RESTORE_FINAL_TOKEN_CEILING),
         compressed: true,
-        summaryFallback: false,
       };
     } catch (error) {
       Logger.warning(`云端历史摘要失败，降级保留最近上下文: ${describeError(error)}`);
       return {
         messages: trimToTokenBudget(messages, CLOUD_RESTORE_DIRECT_TOKEN_BUDGET),
         compressed: true,
-        summaryFallback: true,
       };
     }
   }
@@ -254,56 +224,36 @@ export function normalizeAgentContextMessages(
   let episodeId = 'cloud:initial';
 
   for (const message of messages) {
-    const role = normalizedAgentContextRole(message);
     if (
-      !role
+      message.context_eligible !== true
       || normalizeUID(message.agent_id || message.agent_uid) !== normalizeUID(request.agentId)
+      || (message.context_role !== 'user' && message.context_role !== 'assistant')
     ) {
       continue;
     }
 
     let text = cloudMessageText(message);
-    if (role === 'assistant') {
+    if (message.context_role === 'assistant') {
       text = stripAssistantTranscriptArtifacts(text);
     }
     if (!text || isNonAnswerPlaceholder(text)) continue;
-    if (request.topicType === 'group' && role === 'user') {
+    if (request.topicType === 'group' && message.context_role === 'user') {
       const speaker = cloudSpeakerLabel(message);
-      if (speaker) text = `[发言人: ${speaker}]\n${text}`;
+      if (speaker) text = `[群聊成员 ${speaker}]\n${text}`;
     }
 
-    if (role === 'user') {
+    if (message.context_role === 'user') {
       episodeId = `cloud:${message.seq_id || message.id}`;
     }
     normalized.push({
-      role,
+      role: message.context_role,
       content: text,
       __episodeId: episodeId,
-      __remoteContextSource: 'catscompany.agent_context',
-      __remoteContextId: agentContextMessageSeq(message),
-      ...(role === 'user' ? { __episodeInputKind: 'root' as const } : {}),
+      ...(message.context_role === 'user' ? { __episodeInputKind: 'root' as const } : {}),
     });
   }
 
   return normalized;
-}
-
-function normalizedAgentContextRole(
-  message: CatsAgentContextMessage,
-): 'user' | 'assistant' | undefined {
-  if (
-    message.context_role === 'other_agent'
-    && message.context_reason === 'other_agent_message'
-  ) {
-    return 'user';
-  }
-  if (
-    message.context_eligible === true
-    && (message.context_role === 'user' || message.context_role === 'assistant')
-  ) {
-    return message.context_role;
-  }
-  return undefined;
 }
 
 function findLastClearBoundaryIndex(
@@ -465,10 +415,4 @@ function normalizeUID(value: unknown): string {
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function isTimeoutAbortReason(reason: unknown): boolean {
-  return !!reason
-    && typeof reason === 'object'
-    && (reason as { name?: unknown }).name === 'TimeoutError';
 }

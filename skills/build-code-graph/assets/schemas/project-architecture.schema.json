@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openai.local/build-code-graph/project-architecture.schema.json",
+  "title": "Project Architecture Profile",
+  "type": "object",
+  "required": ["schemaVersion", "project", "groups", "components", "edgeSemantics", "flows", "layout"],
+  "properties": {
+    "schemaVersion": { "const": "1.0" },
+    "project": {
+      "type": "object",
+      "required": ["name", "language", "sourceRoots"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "language": { "type": "string", "minLength": 1 },
+        "locale": { "type": "string", "minLength": 2 },
+        "description": { "type": "string" },
+        "sourceRoots": { "type": "array", "items": { "type": "string" } },
+        "excludePatterns": { "type": "array", "items": { "type": "string" } },
+        "sourceExtensions": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": true
+    },
+    "groups": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "label"],
+        "properties": {
+          "id": { "$ref": "#/$defs/id" },
+          "label": { "type": "string", "minLength": 1 },
+          "summary": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "components": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "label", "group", "filePatterns"],
+        "properties": {
+          "id": { "$ref": "#/$defs/id" },
+          "label": { "type": "string", "minLength": 1 },
+          "summary": { "type": "string" },
+          "group": { "$ref": "#/$defs/id" },
+          "filePatterns": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+          "excludePatterns": { "type": "array", "items": { "type": "string" } },
+          "internalSteps": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/internalStep" }
+          },
+          "internalEdges": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/internalEdge" }
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "edgeSemantics": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["source", "target", "label", "kind"],
+        "properties": {
+          "id": { "$ref": "#/$defs/id" },
+          "source": { "$ref": "#/$defs/id" },
+          "target": { "$ref": "#/$defs/id" },
+          "label": { "type": "string", "minLength": 1 },
+          "kind": { "enum": ["data", "control", "async", "init", "dependency"] },
+          "payload": { "type": "string" },
+          "sourceStep": { "$ref": "#/$defs/id" },
+          "targetStep": { "$ref": "#/$defs/id" },
+          "evidenceRequired": { "type": "boolean" },
+          "references": { "type": "array", "items": { "type": "string" } }
+        },
+        "additionalProperties": false
+      }
+    },
+    "flows": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "label", "kind", "steps"],
+        "properties": {
+          "id": { "$ref": "#/$defs/id" },
+          "label": { "type": "string", "minLength": 1 },
+          "summary": { "type": "string" },
+          "kind": { "enum": ["startup", "request", "turn", "tool", "persistence", "async", "custom"] },
+          "steps": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["component"],
+              "properties": {
+                "component": { "$ref": "#/$defs/id" },
+                "step": { "$ref": "#/$defs/id" },
+                "label": { "type": "string" }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "layout": {
+      "type": "object",
+      "properties": {
+        "direction": { "enum": ["LR", "TB"] },
+        "groupOrder": { "type": "array", "items": { "$ref": "#/$defs/id" } },
+        "componentOrder": { "type": "array", "items": { "$ref": "#/$defs/id" } },
+        "edgeOverrides": { "type": "object" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]*$"
+    },
+    "internalEdge": {
+      "type": "object",
+      "required": ["source", "target"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "source": { "$ref": "#/$defs/id" },
+        "target": { "$ref": "#/$defs/id" },
+        "label": { "type": "string" },
+        "kind": { "enum": ["data", "control", "async", "init", "dependency"] },
+        "payload": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "internalStep": {
+      "type": "object",
+      "required": ["id", "label"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "label": { "type": "string", "minLength": 1 },
+        "summary": { "type": "string" },
+        "file": { "type": "string" },
+        "symbol": { "type": "string" },
+        "tone": { "enum": ["entry", "process", "decision", "exit", "state"] },
+        "children": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/internalStep" }
+        },
+        "internalEdges": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/internalEdge" }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

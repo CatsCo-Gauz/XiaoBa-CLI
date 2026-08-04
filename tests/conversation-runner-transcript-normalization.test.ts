@@ -421,18 +421,11 @@ test('runner keeps Responses reasoning and matching function calls in the tool t
       arguments: '{"command":"echo ok"}',
     },
   ];
-  const providerState = {
-    schema: 'xiaoba.provider_state.v1' as const,
-    apiType: 'openai-responses' as const,
-    model: 'gpt-test',
-    endpointFingerprint: '0123456789abcdef',
-  };
   const mock = createMockAI([
     {
       content: null,
       toolCalls: [toolCall],
       providerContent,
-      providerState,
       usage: {
         promptTokens: 100,
         completionTokens: 20,
@@ -464,8 +457,6 @@ test('runner keeps Responses reasoning and matching function calls in the tool t
   assert.equal(result.response, 'done');
   assert.deepEqual(assistantWithTool?.providerContent, providerContent);
   assert.deepEqual(secondRequestAssistant?.providerContent, providerContent);
-  assert.deepEqual(assistantWithTool?.providerState, providerState);
-  assert.deepEqual(secondRequestAssistant?.providerState, providerState);
 });
 
 test('runner injects tool target context into provider transcript only', async () => {
@@ -1388,39 +1379,6 @@ test('runner keeps repeated send_file calls in the same assistant response as le
     ),
     'send_file should not inject assistant state markers for repeated sends',
   );
-});
-
-test('runner does not infer rate limiting from ordinary failed tool output', () => {
-  const result: ToolResult = {
-    tool_call_id: 'call_shell',
-    role: 'tool',
-    name: 'execute_shell',
-    content: [
-      'Command failed',
-      "command: sed -n '1,80p' src/openai-provider.ts",
-      "stdout: throw new Error('rate limit response')",
-      'stderr: Segmentation fault',
-    ].join('\n'),
-    ok: false,
-    errorCode: 'TOOL_EXECUTION_ERROR',
-    retryable: true,
-  };
-
-  assert.equal((ConversationRunner as any).isRateLimitError(result), false);
-});
-
-test('runner still recognizes structured rate-limit errors', () => {
-  const result: ToolResult = {
-    tool_call_id: 'call_remote',
-    role: 'tool',
-    name: 'remote_api',
-    content: 'request rejected',
-    ok: false,
-    errorCode: 'RATE_LIMIT',
-    retryable: true,
-  };
-
-  assert.equal((ConversationRunner as any).isRateLimitError(result), true);
 });
 
 test('runner does not locally retry failed outbound file sends unless the failure is rate limited', async () => {

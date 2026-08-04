@@ -7,12 +7,14 @@ import { configCommand } from './commands/config';
 import { registerSkillCommand } from './commands/skill';
 import { feishuCommand } from './commands/feishu';
 import { runtimeCommand } from './commands/runtime';
+import { registerAgentRunCommand } from './commands/agent-run';
 import { APP_VERSION } from './version';
 
 function main() {
   const program = new Command();
 
-  Logger.brand();
+  if (process.argv[2] === 'run') Logger.setSilentMode(true);
+  else Logger.brand();
 
   program
     .name('catsco')
@@ -76,6 +78,20 @@ function main() {
       const { dashboardCommand } = await import('./commands/dashboard');
       await dashboardCommand(options);
     });
+
+  program
+    .command('agent-run-board')
+    .description('Start the standalone read-only Agent Run Board')
+    .option('--host <host>', 'Bind host', '127.0.0.1')
+    .option('-p, --port <port>', 'Bind port', '3810')
+    .option('--api-key <key>', 'Require an API key (or XIAOBA_AGENT_RUN_BOARD_API_KEY)')
+    .option('--store <path>', 'Read Agent Runs from this store file')
+    .action(async (options) => {
+      const { agentRunBoardCommand } = await import('./commands/agent-run-board');
+      await agentRunBoardCommand(options);
+    });
+
+  registerAgentRunCommand(program);
 
   program
     .command('runtime')

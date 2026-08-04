@@ -494,8 +494,13 @@ export function extractLearningEpisodes(
   for (let index = 0; index < turns.length; index++) {
     const deliveryTurn = turns[index];
     if (!newTurnNumbers.has(deliveryTurn.turn)) continue;
+    // Runtime observations are transported to the model as role=user, but the
+    // session log preserves their origin. They are internal continuations, not
+    // human requests, and must never mint Learning Episodes or Skill candidates.
+    if (isRuntimeObservationTurn(deliveryTurn)) continue;
     const deliverySourceFilePath = turnSourceFilePath(deliveryTurn, unit.filePath);
-    const next = turns[index + 1];
+    const adjacent = turns[index + 1];
+    const next = adjacent && !isRuntimeObservationTurn(adjacent) ? adjacent : undefined;
     const completionEvidence = detectCompletionEvidence(deliverySourceFilePath, deliveryTurn);
     const evidence = uniqueEvidence([
       ...completionEvidence,
@@ -627,6 +632,9 @@ export function extractLearningEpisodes(
     const delivery = turns[index];
     const correction = turns[index + 1];
     if (!newTurnNumbers.has(correction.turn) || newTurnNumbers.has(delivery.turn)) continue;
+    // Internal runtime observations cannot accept or contradict a user's
+    // preceding delivery episode merely because they use role=user transport.
+    if (isRuntimeObservationTurn(correction)) continue;
     const deliverySourceFilePath = turnSourceFilePath(delivery, unit.filePath);
     const deliveryEvidence = detectCompletionEvidence(deliverySourceFilePath, delivery);
     const signal = detectContradiction(deliverySourceFilePath, delivery, correction, unit.filePath);
@@ -822,10 +830,10 @@ function extractSemanticObservations(
   const delivery = turns[deliveryIndex];
   if (!delivery) return [];
   const observations: SemanticObservation[] = [];
-  const intentTurns: CompletedTurn[] = [delivery];
+  const intentTurns: CompletedTurn[] = isRuntimeObservationTurn(delivery) ? [] : [delivery];
   for (let index = deliveryIndex - 1; index >= 0; index--) {
     const preceding = turns[index];
-    if (!preceding) continue;
+    if (!preceding || isRuntimeObservationTurn(preceding)) continue;
     const sourceFilePath = turnSourceFilePath(preceding, fallbackSourceFilePath);
     if (hasDeliveryEvidence(detectCompletionEvidence(sourceFilePath, preceding))) break;
     if (
@@ -956,6 +964,7 @@ function collectPrecedingWorkflowEvidence(
   const evidence: EpisodeEvidenceRef[] = [];
   for (let index = deliveryIndex - 1; index >= 0; index--) {
     const preceding = turns[index];
+    if (isRuntimeObservationTurn(preceding)) continue;
     const sourceFilePath = turnSourceFilePath(preceding, unitFilePath);
     if (hasDeliveryEvidence(detectCompletionEvidence(sourceFilePath, preceding))) break;
     const workflowEvidence = detectWorkflowEvidence(sourceFilePath, preceding);
@@ -1234,6 +1243,11 @@ function detectAcceptance(
 function runtimeSessionIdOf(turn: CompletedTurn): string {
   const candidate = turn as SessionTurnLogEntry & { runtime_session_id?: string; runtime_id?: string };
   return String(candidate.runtime_session_id || candidate.runtime_id || candidate.session_id).trim();
+}
+
+function isRuntimeObservationTurn(turn: CompletedTurn): boolean {
+  const source = (turn as SessionTurnLogEntry).user?.runtime_observation_source;
+  return typeof source === 'string' && source.trim().length > 0;
 }
 
 /** Read the durable AgentTurnController correlation without guessing for legacy entries. */

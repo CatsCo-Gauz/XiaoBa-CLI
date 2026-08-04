@@ -65,6 +65,10 @@ export class Logger {
     return this.logContext.run({ sessionId: normalizedSessionId, sessionLogger }, fn);
   }
 
+  static setSilentMode(silent: boolean): void {
+    this.silentMode = silent;
+  }
+
   static openLogFile(sessionType: string, sessionKey?: string, silent: boolean = false): void {
     this.silentMode = silent;
     const now = new Date();
@@ -98,8 +102,8 @@ export class Logger {
     console.log(styles.success(message));
   }
 
-  static error(message: string, event?: SessionRuntimeLogEvent): void {
-    this.writeToFile('ERROR', message, event);
+  static error(message: string): void {
+    this.writeToFile('ERROR', message);
     console.error(styles.error(message));
   }
 

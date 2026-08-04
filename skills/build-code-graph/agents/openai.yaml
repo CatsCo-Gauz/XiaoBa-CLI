@@ -1,0 +1,4 @@
+interface:
+  display_name: "Build Code Graph"
+  short_description: "Build evidence-backed, drill-down code architecture graphs"
+  default_prompt: "Analyze this repository and produce a validated, interactive code graph with runtime flows and drill-down component views."

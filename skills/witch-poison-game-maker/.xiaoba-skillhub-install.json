@@ -1,0 +1,17 @@
+{
+  "source": "skillhub",
+  "userId": "user_6ad0bbc312044e369abc3f8516e071f8",
+  "skillId": "uma/witch-poison-game-maker",
+  "name": "witch-poison-game-maker",
+  "installName": "witch-poison-game-maker",
+  "version": "1.0.3",
+  "packageChecksumSha256": "21bc47f0b97a97225caabd701163cf1a8b8f1e812872528b4aa47369e87b2a6b",
+  "signature": {
+    "keyId": "catsco-skillhub-prod-2026-01",
+    "signedAt": "2026-07-22T13:03:44.088Z",
+    "algorithm": "ed25519",
+    "signature": "WEHcIzTM9VtjbL9otr1NppoyX7iP7z2i3A1Gc6NVKpDGeggkZQFf95WIgs6rvCtydMw0ERJOYDnKO+4h+BwbDg=="
+  },
+  "packageUrl": "https://logs.catsco.fun:9000/packages/uma/witch-poison-game-maker/1.0.3/witch-poison-game-maker-1.0.3-21bc47f0b97a.skillpkg",
+  "installedAt": "2026-07-28T08:25:38.421Z"
+}

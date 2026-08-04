@@ -18,10 +18,6 @@ export interface ResetSessionStateResult {
   lastActiveAt: number;
 }
 
-export interface ClearSessionStateResult extends ResetSessionStateResult {
-  persisted: boolean;
-}
-
 export interface PersistAndClearResult {
   messages: Message[];
   saved: boolean;
@@ -70,20 +66,18 @@ export class SessionLifecycleManager {
     };
   }
 
-  clear(): ClearSessionStateResult {
-    const sessionDeleted = this.sessionStore.deleteSession(this.options.sessionKey);
-    const stateDeleted = this.sessionStore.deleteRuntimeState(this.options.sessionKey);
-    let persisted = sessionDeleted && stateDeleted;
+  clear(): ResetSessionStateResult {
+    this.sessionStore.deleteSession(this.options.sessionKey);
+    this.sessionStore.deleteRuntimeState(this.options.sessionKey);
     for (const cleanupKey of this.resolveLegacyCleanupKeys()) {
-      const legacySessionDeleted = this.sessionStore.deleteSession(cleanupKey);
-      const legacyStateDeleted = this.sessionStore.deleteRuntimeState(cleanupKey);
-      persisted = legacySessionDeleted && legacyStateDeleted && persisted;
+      this.sessionStore.deleteSession(cleanupKey);
+      this.sessionStore.deleteRuntimeState(cleanupKey);
     }
-    return { ...this.reset(), persisted };
+    return this.reset();
   }
 
-  saveContext(messages: Message[]): boolean {
-    return this.sessionStore.saveContext(this.options.sessionKey, messages);
+  saveContext(messages: Message[]): void {
+    this.sessionStore.saveContext(this.options.sessionKey, messages);
   }
 
   loadCurrentDirectory(): string | undefined {
@@ -111,10 +105,10 @@ export class SessionLifecycleManager {
     return Number.isFinite(cursor) && cursor > 0 ? cursor : 0;
   }
 
-  saveRemoteContextCursor(source: string, cursor: number): boolean {
-    if (!source || !Number.isFinite(cursor) || cursor <= 0) return false;
+  saveRemoteContextCursor(source: string, cursor: number): void {
+    if (!source || !Number.isFinite(cursor) || cursor <= 0) return;
     const state = this.sessionStore.loadRuntimeState(this.options.sessionKey);
-    return this.sessionStore.saveRuntimeState(this.options.sessionKey, {
+    this.sessionStore.saveRuntimeState(this.options.sessionKey, {
       ...state,
       remoteContextCursors: {
         ...(state.remoteContextCursors || {}),
@@ -128,12 +122,8 @@ export class SessionLifecycleManager {
       return { messages, saved: false, savedCount: 0 };
     }
 
-    const saved = this.saveContext(messages);
-    return {
-      messages: saved ? [] : messages,
-      saved,
-      savedCount: saved ? messages.length : 0,
-    };
+    this.saveContext(messages);
+    return { messages: [], saved: true, savedCount: messages.length };
   }
 
   hasPendingRestore(): boolean {

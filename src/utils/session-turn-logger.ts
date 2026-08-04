@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { Message, ContentBlock } from '../types';
 import type {
@@ -28,7 +29,6 @@ export type {
   SessionTurnLogEntry,
 } from './session-log-schema';
 
-const SESSION_LOG_DIR = PathResolver.getLogsPath('sessions');
 const MAX_TOOL_RESULT_LENGTH = parseOptionalLimit(process.env.XIAOBA_SESSION_TOOL_RESULT_LIMIT);
 const MAX_RUNTIME_FEEDBACK_LENGTH = Number(process.env.XIAOBA_SESSION_RUNTIME_FEEDBACK_LIMIT || 4000);
 
@@ -37,6 +37,11 @@ function parseOptionalLimit(raw: string | undefined): number | null {
   const parsed = Number(raw);
   if (!Number.isFinite(parsed) || parsed <= 0) return null;
   return parsed;
+}
+
+function isSafelyWithinDirectory(candidate: string, root: string): boolean {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  return relative !== '' && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
 export interface LogTurnOptions {
@@ -56,15 +61,26 @@ export class SessionTurnLogger {
   private sessionType: string;
   private sessionId: string;
   private logFilePath: string;
+  private sessionLogAppendSignalPath: string;
   private turnCounter = 0;
 
-  constructor(sessionType: string, sessionId: string) {
+  constructor(sessionType: string, sessionId: string, runtimeDataRoot?: string) {
     this.sessionType = sessionType;
     this.sessionId = sessionId;
 
+    const configuredRuntimeDataRoot = runtimeDataRoot
+      ? path.resolve(runtimeDataRoot)
+      : PathResolver.getRuntimeDataRoot();
+    const resolvedRuntimeDataRoot = process.env.NODE_TEST_CONTEXT
+      && !isSafelyWithinDirectory(configuredRuntimeDataRoot, os.tmpdir())
+      ? (isSafelyWithinDirectory(process.cwd(), os.tmpdir())
+          ? process.cwd()
+          : path.join(os.tmpdir(), 'xiaoba-node-test-session-logs', String(process.pid)))
+      : configuredRuntimeDataRoot;
+    this.sessionLogAppendSignalPath = PathResolver.getSessionLogAppendSignalPath(resolvedRuntimeDataRoot);
     const date = new Date();
     const dateStr = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
-    const dir = path.join(SESSION_LOG_DIR, sessionType, dateStr);
+    const dir = path.join(resolvedRuntimeDataRoot, 'logs', 'sessions', sessionType, dateStr);
 
     fs.mkdirSync(dir, { recursive: true });
     const safeSessionId = sessionId.replace(/[:<>"|?*]/g, '_');
@@ -190,11 +206,35 @@ export class SessionTurnLogger {
   private appendLog(entry: SessionLogEntry): boolean {
     try {
       fs.appendFileSync(this.logFilePath, JSON.stringify(entry) + '\n');
+      this.notifySessionLogAppend();
       return true;
     } catch (error) {
       // 日志写入失败不影响主流程
       console.error('[SessionTurnLogger] Failed to write log:', error);
       return false;
+    }
+  }
+
+  /**
+   * Persist a lightweight cross-process hint after a JSONL line is durable.
+   * The heartbeat owner watches this file and coalesces append notifications;
+   * logging itself never imports or depends on the runtime scheduler.
+   */
+  private notifySessionLogAppend(): void {
+    const signalPath = this.sessionLogAppendSignalPath;
+    const temporaryPath = `${signalPath}.${process.pid}.${process.hrtime.bigint()}.tmp`;
+    try {
+      fs.mkdirSync(path.dirname(signalPath), { recursive: true });
+      fs.writeFileSync(temporaryPath, `${Date.now()}\n`);
+      fs.renameSync(temporaryPath, signalPath);
+    } catch (error) {
+      try {
+        fs.rmSync(temporaryPath, { force: true });
+      } catch {
+        // Best-effort cleanup; the append itself already succeeded.
+      }
+      // A missed hint only falls back to the periodic scan; never fail a turn.
+      console.error('[SessionTurnLogger] Failed to signal log append:', error);
     }
   }
 

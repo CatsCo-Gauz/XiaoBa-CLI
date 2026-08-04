@@ -18,7 +18,6 @@ import {
 } from '../bot-definition/cloud-client';
 import { CloudBotModelRuntimeReloadController } from '../bot-definition/runtime-reload';
 import { createBotDefinitionSyncService } from '../bot-definition/service';
-import { getPromptReconcileCoordinator } from '../bot-definition/prompt-sync';
 
 const CONNECTOR_OWNER_POLL_MS = 2000;
 const CLOUD_MODEL_POLL_MS = 5000;
@@ -56,12 +55,7 @@ export async function catscompanyCommand(): Promise<void> {
     Logger.info(`CatsCo bot ${preparedBot.botId} 已在当前设备准备 ${preparedBot.definition.model.kind === 'catalog' ? preparedBot.definition.model.modelId : '模型'} 的运行材料。`);
   }
   const config = ConfigManager.getConfig();
-  const resolvedRuntime = resolveCatsCoRuntimeConfig({ runtimeRoot, env: process.env, config });
-  Object.assign(process.env, resolvedRuntime.envOverlay);
-  const resolved: CatsCoCommandConfigResolution = {
-    missing: resolvedRuntime.missing,
-    config: resolvedRuntime.connector,
-  };
+  const resolved = resolveCatsCoCommandConfig(config);
 
   const connectorConfig = resolved.config;
   if (!connectorConfig) {
@@ -269,9 +263,6 @@ async function applyCloudModelRuntimeSelection(
 ): Promise<'applied' | 'deferred'> {
   const botId = options.botId;
   if (!botId || !options.canApply()) return 'deferred';
-  if (options.selection.definition) {
-    return applyCloudBotDefinitionSelection(options);
-  }
   const definitionService = createBotDefinitionSyncService({ runtimeRoot: options.runtimeRoot });
   definitionService.pullOrBootstrap(botId);
   const previousCloudDefinition = definitionService.readCloudModelOverride(botId);
@@ -290,7 +281,6 @@ async function applyCloudModelRuntimeSelection(
       auth: options.auth,
       cloudSelection: options.selection,
       acknowledgeCloudSelection: false,
-      prepareSkills: false,
     });
   } catch (error) {
     restorePreviousModelFiles();
@@ -362,121 +352,6 @@ async function applyCloudModelRuntimeSelection(
   return 'applied';
 }
 
-async function applyCloudBotDefinitionSelection(
-  options: ApplyCloudModelRuntimeSelectionOptions,
-): Promise<'applied' | 'deferred'> {
-  const incoming = options.selection.definition!;
-  const definitionService = createBotDefinitionSyncService({ runtimeRoot: options.runtimeRoot });
-  const previousDefinition = definitionService.read(options.botId)
-    ?? definitionService.pullOrBootstrap(options.botId)?.definition;
-  const previousCatalogRuntime = definitionService.readCatalogRuntime(options.botId);
-  const promptCoordinator = getPromptReconcileCoordinator({
-    runtimeRoot: options.runtimeRoot,
-    definitionService,
-  });
-  const previousPrompt = promptCoordinator.captureActiveSnapshot();
-  const modelChanged = !previousDefinition
-    || JSON.stringify(previousDefinition.model) !== JSON.stringify(incoming.model);
-
-  if (modelChanged && (!options.canApply() || !options.currentBot().isIdleForRuntimeReload())) {
-    return 'deferred';
-  }
-
-  try {
-    const latestSelection = await pullCloudBotModelSelection({
-      botId: options.botId,
-      auth: options.auth,
-    });
-    if (!cloudSelectionsMatch(latestSelection, options.selection)) return 'deferred';
-  } catch (error) {
-    Logger.warning(`CatsCo BotDefinition revision check failed; applying it was deferred: ${errorMessage(error)}`);
-    return 'deferred';
-  }
-
-  const restorePreviousRuntime = () => {
-    if (previousDefinition) {
-      const activeSkills = definitionService.read(options.botId)?.skills;
-      definitionService.acceptCanonical({
-        ...previousDefinition,
-        ...(activeSkills !== undefined ? { skills: activeSkills } : {}),
-      });
-    }
-    if (previousCatalogRuntime) definitionService.storeCatalogRuntime(previousCatalogRuntime);
-    promptCoordinator.restoreActiveSnapshot(previousPrompt);
-  };
-
-  let prepared: Awaited<ReturnType<typeof prepareBoundBotDefinition>>;
-  let appliedSelection = options.selection;
-  try {
-    definitionService.acceptCanonical(incoming);
-    prepared = await prepareBoundBotDefinition({
-      runtimeRoot: options.runtimeRoot,
-      botId: options.botId,
-      auth: options.auth,
-      acknowledgeCloudSelection: false,
-    });
-  } catch (error) {
-    restorePreviousRuntime();
-    const message = redactCloudBotModelError(error, options.selection);
-    await acknowledgeCloudModelApply(options, message);
-    throw new Error(message);
-  }
-
-  if (
-    !prepared
-    || prepared.cloudRevision === undefined
-    || prepared.cloudRevision < options.selection.revision
-    || prepared.cloudApplyError
-  ) {
-    const message = prepared?.cloudApplyError || 'Cloud BotDefinition runtime preparation did not complete.';
-    restorePreviousRuntime();
-    await acknowledgeCloudModelApply(options, message);
-    throw new Error(message);
-  }
-  appliedSelection = {
-    ...options.selection,
-    revision: prepared.cloudRevision,
-    definition: prepared.definition,
-  };
-
-  if (!modelChanged) {
-    await acknowledgeCloudModelApply(options, '', appliedSelection);
-    Logger.success(`CatsCo applied BotDefinition revision=${appliedSelection.revision} without restarting the connector.`);
-    return 'applied';
-  }
-
-  const previousBot = options.currentBot();
-  let nextBot: CatsCompanyBot | undefined;
-  try {
-    await previousBot.destroy();
-    nextBot = new CatsCompanyBot(options.connectorConfig);
-    await nextBot.start();
-    await nextBot.waitUntilReady();
-    options.replaceBot(nextBot);
-  } catch (error) {
-    if (nextBot) {
-      await nextBot.destroy().catch(cleanupError => {
-        Logger.warning(`Failed to clean up an unstarted CatsCo connector: ${errorMessage(cleanupError)}`);
-      });
-    }
-    restorePreviousRuntime();
-    const message = redactCloudBotModelError(error, options.selection);
-    await acknowledgeCloudModelApply(options, message, appliedSelection);
-    await recoverCloudModelFallbackConnector({
-      canApply: options.canApply,
-      createBot: () => new CatsCompanyBot(options.connectorConfig),
-      replaceBot: options.replaceBot,
-    });
-    throw new Error(message);
-  }
-
-  await acknowledgeCloudModelApply(options, '', appliedSelection);
-  Logger.success(
-    `CatsCo applied BotDefinition model ${options.selection.modelId}, revision=${options.selection.revision}.`,
-  );
-  return 'applied';
-}
-
 interface RecoverCloudModelFallbackConnectorOptions {
   canApply(): boolean;
   createBot(): CatsCompanyBot;
@@ -518,16 +393,15 @@ function delay(ms: number): Promise<void> {
 async function acknowledgeCloudModelApply(
   options: ApplyCloudModelRuntimeSelectionOptions,
   applyError = '',
-  selection: CloudBotModelSelection = options.selection,
 ): Promise<void> {
   try {
     await acknowledgeCloudBotModelSelection({
       botId: options.botId,
       auth: options.auth,
-    }, selection, applyError);
-    options.clearAckRetry(selection);
+    }, options.selection, applyError);
+    options.clearAckRetry(options.selection);
   } catch (error) {
-    options.scheduleAckRetry(selection, applyError);
+    options.scheduleAckRetry(options.selection, applyError);
     Logger.warning(`CatsCo 云端模型应用状态回报失败: ${errorMessage(error)}`);
   }
 }
@@ -540,10 +414,6 @@ function cloudSelectionsMatch(
   current: CloudBotModelSelection | undefined,
   expected: CloudBotModelSelection,
 ): boolean {
-  if (current?.definition || expected.definition) {
-    return current?.revision === expected.revision
-      && JSON.stringify(current?.definition) === JSON.stringify(expected.definition);
-  }
   return current?.revision === expected.revision
     && (current.kind || 'catalog') === (expected.kind || 'catalog')
     && current.modelId === expected.modelId

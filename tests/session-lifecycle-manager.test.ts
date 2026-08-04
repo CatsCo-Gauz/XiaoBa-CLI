@@ -4,11 +4,6 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { createRequire } from 'node:module';
-import {
-  attachModelErrorDiagnostics,
-  attachRetrySummary,
-  captureModelErrorDiagnostics,
-} from '../src/utils/model-error-observability';
 
 const require = createRequire(import.meta.url);
 
@@ -360,12 +355,6 @@ describe('AgentSession lifecycle', () => {
           { type: 'thinking', thinking: 'hidden chain text', signature: 'sig_secret' },
           { type: 'tool_use', id: 'toolu_1', name: 'read_file', input: { path: 'notes.md' } },
         ],
-        providerState: {
-          schema: 'xiaoba.provider_state.v1',
-          apiType: 'anthropic-messages',
-          model: 'secret-model-scope',
-          endpointFingerprint: 'abcdef1234567890',
-        },
       },
       { role: 'tool', content: 'private tool result', tool_call_id: 'toolu_1', name: 'read_file' },
       { role: 'assistant', content: '读完了' },
@@ -382,7 +371,6 @@ describe('AgentSession lifecycle', () => {
       ['需要读文件', null, '[历史工具结果已省略；read_file 已完成。]', '读完了'],
     );
     assert.equal(restored.some((message: any) => Array.isArray(message.providerContent)), false);
-    assert.equal(restored.some((message: any) => message.providerState), false);
     assert.equal(restored.some((message: any) => message.role === 'tool'), true);
     assert.equal(restored.some((message: any) => message.tool_calls?.length), true);
     assert.equal(
@@ -393,7 +381,6 @@ describe('AgentSession lifecycle', () => {
     assert.equal(restored.some((message: any) => String(message.content || '').includes('private tool result')), false);
     assert.doesNotMatch(raw, /hidden chain text/);
     assert.doesNotMatch(raw, /sig_secret/);
-    assert.doesNotMatch(raw, /secret-model-scope|providerState/);
     assert.doesNotMatch(raw, /provider replay 隐藏内容/);
     assert.doesNotMatch(raw, /private tool result/);
   });
@@ -609,13 +596,13 @@ describe('AgentSession lifecycle', () => {
     assert.equal(session.restoreFromStore(), true);
 
     const compactReasons: string[] = [];
-    (session as any).checkpointCompactionCoordinator.compactIfNeeded = async (messages: any[], options: any) => {
-      compactReasons.push(options.phase || '');
-      if (options.phase === 'restore') {
+    (session as any).contextWindowManager.compactIfNeeded = async (messages: any[], options: any) => {
+      compactReasons.push(options.reason || '');
+      if (options.reason === '恢复后') {
         await options.onStatus?.({
           status: 'start',
           sessionKey: 'catscompany:lifecycle-compact-status',
-          phase: options.phase,
+          reason: options.reason,
           usedTokens: 900,
           maxTokens: 1000,
           usagePercent: 90,
@@ -623,17 +610,14 @@ describe('AgentSession lifecycle', () => {
         await options.onStatus?.({
           status: 'complete',
           sessionKey: 'catscompany:lifecycle-compact-status',
-          phase: options.phase,
+          reason: options.reason,
           usedTokens: 900,
           maxTokens: 1000,
           usagePercent: 90,
           messageCount: messages.length,
         });
       }
-      return {
-        compacted: options.phase === 'restore',
-        messages,
-      };
+      return messages;
     };
 
     const thinking: string[] = [];
@@ -645,7 +629,7 @@ describe('AgentSession lifecycle', () => {
       },
     });
 
-    assert.deepStrictEqual(compactReasons, ['pre_turn', 'restore']);
+    assert.deepStrictEqual(compactReasons, ['处理前', '恢复后']);
     assert.deepStrictEqual(thinking, [
       CONTEXT_COMPACTION_START_MESSAGE,
       CONTEXT_COMPACTION_COMPLETE_MESSAGE,
@@ -663,11 +647,11 @@ describe('AgentSession lifecycle', () => {
     );
 
     let preCompactMessages: any[] = [];
-    (session as any).checkpointCompactionCoordinator.compactIfNeeded = async (messages: any[], options: any) => {
-      if (options.phase === 'pre_turn') {
+    (session as any).contextWindowManager.compactIfNeeded = async (messages: any[], options: any) => {
+      if (options.reason === '处理前') {
         preCompactMessages = messages.map(message => ({ ...message }));
       }
-      return { compacted: false, messages };
+      return messages;
     };
 
     await session.handleMessage('继续');
@@ -874,70 +858,6 @@ describe('AgentSession lifecycle', () => {
     assert.doesNotMatch(result.text, /API错误|状态码|503/);
   });
 
-  test('handleMessage logs one structured event only when an error interrupts the conversation', async () => {
-    const { AgentSession, ERROR_MESSAGE } = loadSessionModules();
-    const providerError = Object.assign(new Error('Request failed with status code 400'), {
-      status: 400,
-    });
-    const diagnostics = captureModelErrorDiagnostics(providerError, {
-      provider: 'openai',
-      model: 'deepseek-v4-flash',
-      phase: 'model_request',
-    });
-    attachModelErrorDiagnostics(providerError, diagnostics);
-    attachRetrySummary(providerError, {
-      attempt_count: 3,
-      retry_count: 2,
-      max_retries: 2,
-      elapsed_ms: 3100,
-      max_elapsed_ms: 15000,
-      stop_reason: 'retry_limit_exhausted',
-    }, {
-      call_id: 'call-interrupted',
-      attempt_id: 'call-interrupted:3',
-      attempt_number: 3,
-      episode_id: 'episode-interrupted',
-    });
-    const session = new AgentSession('catscompany:lifecycle-turn-error-event', buildMockServices({
-      aiService: {
-        getConfig() {
-          return { provider: 'openai', model: 'deepseek-v4-flash' };
-        },
-        async chatStream() {
-          throw providerError;
-        },
-      },
-    }), 'catscompany');
-    session.setSystemPromptProvider(() => 'system prompt');
-
-    const result = await session.handleMessage('继续');
-
-    assert.equal(result.taskOutcome, 'failed');
-    assert.equal(result.text, ERROR_MESSAGE);
-    const logPath = (session as any).sessionTurnLogger.getLogFilePath();
-    const entries = fs.readFileSync(logPath, 'utf8')
-      .split(/\r?\n/)
-      .filter(Boolean)
-      .map(line => JSON.parse(line));
-    const turnErrors = entries.filter(entry => entry?.event?.type === 'turn_error');
-    assert.equal(turnErrors.length, 1);
-    assert.equal(turnErrors[0].event.payload.outcome, 'conversation_interrupted');
-    assert.equal(turnErrors[0].event.payload.category, 'provider_rejected');
-    assert.equal(turnErrors[0].event.payload.classification_confidence, 'low');
-    assert.equal(turnErrors[0].event.payload.http_status, 400);
-    assert.equal(turnErrors[0].event.payload.error_origin, 'provider');
-    assert.equal(turnErrors[0].event.payload.phase, 'model_request');
-    assert.equal(turnErrors[0].event.payload.retry_count, 2);
-    assert.equal(turnErrors[0].event.payload.attempt_count, 3);
-    assert.equal(turnErrors[0].event.payload.retry_stop_reason, 'retry_limit_exhausted');
-    assert.equal(turnErrors[0].event.payload.model_call_id, 'call-interrupted');
-    assert.equal(turnErrors[0].event.payload.model_attempt_id, 'call-interrupted:3');
-    assert.equal(turnErrors[0].event.payload.model_attempt_number, 3);
-    assert.equal(turnErrors[0].event.payload.episode_id, 'episode-interrupted');
-    assert.match(turnErrors[0].event.payload.error_fingerprint, /^[a-f0-9]{16}$/);
-    assert.equal(typeof turnErrors[0].event.payload.partial_progress_preserved, 'boolean');
-  });
-
   test('cleanup persists without invoking hidden AI wakeup checks', async () => {
     const { AgentSession, SessionStore } = loadSessionModules();
     let aiCalls = 0;
@@ -983,162 +903,6 @@ describe('AgentSession lifecycle', () => {
     assert.equal(await session.summarizeAndDestroy(), true);
     assert.equal(aiCalls, 0);
     assert.equal((session as any).messages.length, 0);
-  });
-
-  test('durable remote context persists beyond the transient 30-message injection cap', async () => {
-    const { AgentSession, SessionStore } = loadSessionModules();
-    const sessionKey = 'cc_group:durable-remote-context';
-    const session = new AgentSession(sessionKey, buildMockServices(), 'catscompany');
-    session.setSystemPromptProvider(() => 'system prompt');
-    const history = Array.from({ length: 31 }, (_, index) => `remote group history ${index + 1}`);
-
-    assert.equal(await session.appendDurableContext(history), true);
-    const inMemory = (session as any).messages as any[];
-    assert.equal(inMemory.filter(message => history.includes(message.content)).length, 31);
-    assert.equal(inMemory.some(message => message.__injected), false);
-
-    const persisted = SessionStore.getInstance().loadContext(sessionKey);
-    assert.deepStrictEqual(persisted.map(message => message.content), history);
-
-    const restored = new AgentSession(sessionKey, buildMockServices(), 'catscompany');
-    restored.setSystemPromptProvider(() => 'system prompt');
-    assert.equal(restored.restoreFromStore(), true);
-    await restored.init();
-    assert.equal((restored as any).messages.filter((message: any) => history.includes(message.content)).length, 31);
-  });
-
-  test('durable remote context preserves the restored assistant role', async () => {
-    const { AgentSession, SessionStore } = loadSessionModules();
-    const sessionKey = 'cc_group:remote-assistant-role';
-    const entry = {
-      source: 'catscompany.agent_context',
-      id: 81,
-      role: 'assistant' as const,
-      content: '上一轮由当前 Agent 发出的回复',
-    };
-    const session = new AgentSession(sessionKey, buildMockServices(), 'catscompany');
-    session.setSystemPromptProvider(() => 'system prompt');
-
-    assert.equal(await session.appendDurableContext([entry]), true);
-    assert.equal(
-      (session as any).messages.find((message: any) => message.content === entry.content)?.role,
-      'assistant',
-    );
-    assert.equal(
-      SessionStore.getInstance().loadContext(sessionKey)
-        .find(message => message.content === entry.content)?.role,
-      'assistant',
-    );
-  });
-
-  test('compacted remote context stays idempotent if the process exits before cursor commit', async () => {
-    const { AgentSession } = loadSessionModules();
-    const sessionKey = 'cc_group:remote-compaction-crash';
-    const entry = {
-      source: 'catscompany.agent_context',
-      id: 401,
-      content: 'remote history payload '.repeat(25_000),
-    };
-    let summaryCalls = 0;
-    const services = buildMockServices({
-      aiService: {
-        async chatStream(_messages: any, _tools: any, callbacks: any) {
-          summaryCalls++;
-          callbacks?.onText?.('compacted remote history');
-          return { content: 'compacted remote history', toolCalls: [] };
-        },
-      },
-    });
-    const interrupted = new AgentSession(sessionKey, services, 'catscompany');
-    interrupted.setSystemPromptProvider(() => 'system prompt');
-    const interruptedLifecycle = (interrupted as any).lifecycleManager;
-    interruptedLifecycle.saveRemoteContextCursor = () => {
-      throw new Error('simulated process exit before cursor commit');
-    };
-
-    await assert.rejects(
-      interrupted.appendDurableContext([entry], { source: entry.source, cursor: 402 }),
-      /simulated process exit/,
-    );
-    assert.equal(summaryCalls, 1);
-
-    const restored = new AgentSession(sessionKey, services, 'catscompany');
-    restored.setSystemPromptProvider(() => 'system prompt');
-    assert.equal(restored.restoreFromStore(), true);
-    assert.equal(
-      await restored.appendDurableContext([entry], { source: entry.source, cursor: 402 }),
-      true,
-    );
-
-    assert.equal(summaryCalls, 1);
-    assert.equal(restored.getRemoteContextCursor(entry.source), 402);
-  });
-
-  test('durable remote context rolls back on cursor failure and deduplicates after restart', async () => {
-    const { AgentSession, SessionStore } = loadSessionModules();
-    const sessionKey = 'cc_group:remote-cursor-transaction';
-    const entry = { source: 'catscompany.agent_context', id: 91, content: '[发言人: Alice]\nremote message' };
-    const session = new AgentSession(sessionKey, buildMockServices(), 'catscompany');
-    session.setSystemPromptProvider(() => 'system prompt');
-    const lifecycle = (session as any).lifecycleManager;
-    let cursorWrites = 0;
-    const originalSaveCursor = lifecycle.saveRemoteContextCursor.bind(lifecycle);
-    lifecycle.saveRemoteContextCursor = () => {
-      cursorWrites++;
-      return false;
-    };
-
-    assert.equal(await session.appendDurableContext([entry], { source: entry.source, cursor: 92 }), false);
-    assert.equal((session as any).messages.some((message: any) => message.content === entry.content), false);
-    assert.equal(SessionStore.getInstance().loadContext(sessionKey).some(message => message.content === entry.content), false);
-
-    lifecycle.saveRemoteContextCursor = originalSaveCursor;
-    assert.equal(await session.appendDurableContext([entry], { source: entry.source, cursor: 92 }), true);
-    assert.equal((session as any).messages.filter((message: any) => message.content === entry.content).length, 1);
-
-    const restored = new AgentSession(sessionKey, buildMockServices(), 'catscompany');
-    restored.setSystemPromptProvider(() => 'system prompt');
-    assert.equal(restored.restoreFromStore(), true);
-    await restored.init();
-    assert.equal(await restored.appendDurableContext([entry], { source: entry.source, cursor: 93 }), true);
-    assert.equal((restored as any).messages.filter((message: any) => message.content === entry.content).length, 1);
-    assert.equal(cursorWrites, 1);
-  });
-
-  test('cold-start durable append restores before deduplicating remote entries', async () => {
-    const { AgentSession, SessionStore } = loadSessionModules();
-    const sessionKey = 'cc_group:cold-start-remote-dedup';
-    const entry = { source: 'catscompany.agent_context', id: 101, content: '[发言人: Alice]\nalready persisted' };
-    SessionStore.getInstance().saveContext(sessionKey, [{
-      role: 'user',
-      content: entry.content,
-      __remoteContextSource: entry.source,
-      __remoteContextId: entry.id,
-    }]);
-
-    const session = new AgentSession(sessionKey, buildMockServices(), 'catscompany');
-    session.setSystemPromptProvider(() => 'system prompt');
-    assert.equal(session.restoreFromStore(), true);
-
-    assert.equal(await session.appendDurableContext([entry], { source: entry.source, cursor: 102 }), true);
-    assert.equal((session as any).messages.filter((message: any) => message.content === entry.content).length, 1);
-    assert.equal(SessionStore.getInstance().loadContext(sessionKey).filter(message => message.content === entry.content).length, 1);
-    assert.equal(session.getRemoteContextCursor(entry.source), 102);
-  });
-
-  test('clear --all reports local deletion failure instead of claiming files were deleted', async () => {
-    const { AgentSession } = loadSessionModules();
-    const session = new AgentSession('cc_group:clear-all-failure', buildMockServices(), 'catscompany');
-    (session as any).lifecycleManager.clear = () => ({
-      initialized: false,
-      lastActiveAt: Date.now(),
-      persisted: false,
-    });
-
-    const result = await session.handleCommand('clear', ['--all']);
-
-    assert.equal(result.handled, true);
-    assert.match(result.reply || '', /文件删除失败.*重试 \/clear --all/);
   });
 
   test('summarizeAndDestroy returns false for an already empty session', async () => {
